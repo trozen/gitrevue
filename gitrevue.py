@@ -124,6 +124,7 @@ class CFG:
     window_scale  = 0.75    # fraction of screen size on startup
     sash_ratio    = 0.70
     scrollbar_w   = 28
+    minimap_w     = 120
 
 
 # --colour scheme (dracula) --------------------------------------------------
@@ -148,6 +149,31 @@ C = {
 
 
 
+def _blend(color: str, factor: float = 0.5) -> str:
+    """Blend color toward the canvas background by factor (0=bg, 1=color)."""
+    bg = C['bg']
+    def _p(h: str) -> tuple[int, int, int]:
+        h = h.lstrip('#')
+        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    r0, g0, b0 = _p(bg)
+    r1, g1, b1 = _p(color)
+    r = int(r0 + (r1 - r0) * factor)
+    g = int(g0 + (g1 - g0) * factor)
+    b = int(b0 + (b1 - b0) * factor)
+    return f'#{r:02x}{g:02x}{b:02x}'
+
+
+# non-whitespace pixel colours in the minimap; None = leave as canvas bg
+_MINIMAP_COLORS: dict[str, str | None] = {
+    'added':   _blend(C['added_fg'],      0.45),
+    'removed': _blend(C['removed_fg'],    0.45),
+    'hunk':    _blend(C['hunk_fg'],       0.35),
+    'filehdr': _blend(C['fileheader_fg'], 0.35),
+    'fileidx': _blend(C['fileheader_fg'], 0.35),
+    'context': None,
+}
+
+
 # --application ------------------------------------------------------------
 
 def _primary_monitor_size() -> tuple[int, int]:
@@ -170,6 +196,9 @@ def _primary_monitor_size() -> tuple[int, int]:
     return 1920, 1080
 
 
+_MM_LINE_H = 2  # natural minimap pixels per source line (matches VS Code behaviour)
+
+
 class App:
     def __init__(self, root: tk.Tk, diff_text: str) -> None:
         self.root = root
@@ -178,6 +207,9 @@ class App:
         self._diff_files: list[DiffFile] = []
         self._positions: dict[str, str] = {}
         self._pos_order: list[tuple[int, str]] = []
+        self._minimap_lines: list[tuple[str, str]] = []  # (kind, text)
+        self._scroll_pos: tuple[float, float] = (0.0, 1.0)
+        self._minimap_content_h: int = 0
 
         self._build_ui()
         self._load()
@@ -231,7 +263,7 @@ class App:
 
         self._sticky = tk.Label(lf, bg=C['topbar_bg'], fg=C['fg'],
                                  font=font, anchor='w', padx=10, pady=3, text='')
-        self._sticky.grid(row=0, column=0, columnspan=2, sticky='ew')
+        self._sticky.grid(row=0, column=0, columnspan=3, sticky='ew')
 
         self._diff = tk.Text(lf, bg=C['bg'], fg=C['fg'],
                               font=font, wrap='none',
@@ -243,10 +275,18 @@ class App:
         hs = self._make_scrollbar(lf, orient='horizontal', command=self._diff.xview)
         self._diff.configure(yscrollcommand=self._on_diff_yscroll, xscrollcommand=hs.set)
         self._diff.grid(row=1, column=0, sticky='nsew')
-        self._diff_vs.grid(row=1, column=1, sticky='ns')
+
+        self._minimap = tk.Canvas(lf, width=CFG.minimap_w, bg=C['bg'],
+                                   highlightthickness=0)
+        self._minimap.grid(row=1, column=1, rowspan=2, sticky='ns')
+        self._minimap.bind('<Configure>',  lambda e: self._render_minimap())
+        self._minimap.bind('<Button-1>',   self._on_minimap_click)
+        self._minimap.bind('<B1-Motion>',  self._on_minimap_click)
+
+        self._diff_vs.grid(row=1, column=2, sticky='ns')
         hs.grid(row=2, column=0, sticky='ew')
         tk.Frame(lf, bg=C['topbar_bg'],
-                 width=CFG.scrollbar_w, height=CFG.scrollbar_w).grid(row=2, column=1)
+                 width=CFG.scrollbar_w, height=CFG.scrollbar_w).grid(row=2, column=2)
 
         # right: file list
         rf = tk.Frame(self._sash, bg=C['bg'])
@@ -305,6 +345,75 @@ class App:
         if w > 1:
             self._sash.sash_place(0, int(w * CFG.sash_ratio), 0)
 
+    # --minimap ---------------------------------------------------------------
+
+    def _render_minimap(self) -> None:
+        c = self._minimap
+        cw, ch = c.winfo_width(), c.winfo_height()
+        if cw <= 1 or ch <= 1:
+            return
+        n = len(self._minimap_lines)
+        if n == 0:
+            c.delete('all')
+            self._minimap_content_h = 0
+            return
+
+        bg = C['bg']
+        blank = '{' + ' '.join([bg] * cw) + '}'
+
+        # Only stretch when the diff is too tall to fit at natural scale.
+        natural_h = n * _MM_LINE_H
+        img_h = min(natural_h, ch)
+        self._minimap_content_h = img_h
+
+        # Cache rendered rows per source-line index to avoid redundant work
+        # when multiple canvas rows map to the same source line.
+        line_cache: dict[int, str] = {}
+
+        def _row(i: int) -> str:
+            if i in line_cache:
+                return line_cache[i]
+            kind, text = self._minimap_lines[i]
+            color = _MINIMAP_COLORS.get(kind)
+            if color is None:
+                line_cache[i] = blank
+                return blank
+            pixels = [color if x < len(text) and text[x] not in (' ', '\t') else bg
+                      for x in range(cw)]
+            result = '{' + ' '.join(pixels) + '}'
+            line_cache[i] = result
+            return result
+
+        rows = [_row(min(int(y * n / img_h), n - 1)) for y in range(img_h)]
+        img = tk.PhotoImage(width=cw, height=img_h)
+        img.put(' '.join(rows))
+
+        c.delete('all')
+        c.create_image(0, 0, anchor='nw', image=img)
+        c._mm_img = img  # keep reference; PhotoImage is GC'd without it
+        self._update_minimap_viewport()
+
+    def _update_minimap_viewport(self) -> None:
+        c = self._minimap
+        if c.winfo_height() <= 1 or self._minimap_content_h <= 0:
+            return
+        c.delete('viewport')
+        first, last = self._scroll_pos
+        h = self._minimap_content_h
+        y0, y1 = int(first * h), int(last * h)
+        c.create_rectangle(0, y0, c.winfo_width(), y1,
+                           fill=C['fg'], stipple='gray12',
+                           outline=C['fg'], width=1, tags='viewport')
+
+    def _on_minimap_click(self, event: tk.Event) -> None:
+        h = self._minimap_content_h
+        if h <= 0:
+            return
+        first, last = self._scroll_pos
+        span = last - first
+        frac = max(0.0, min(1.0 - span, event.y / h - span / 2))
+        self._diff.yview_moveto(frac)
+
     @staticmethod
     def _file_label(df: DiffFile) -> tuple[str, str]:
         """Return (name_line, index_line) for both the sticky label and the diff header."""
@@ -313,7 +422,9 @@ class App:
 
     def _on_diff_yscroll(self, first: str, last: str) -> None:
         self._diff_vs.set(first, last)
+        self._scroll_pos = (float(first), float(last))
         self._update_sticky_header()
+        self._update_minimap_viewport()
 
     def _update_sticky_header(self) -> None:
         if not self._pos_order:
@@ -358,20 +469,24 @@ class App:
         # diff panel
         self._diff.delete('1.0', 'end')
         self._positions.clear()
+        self._minimap_lines = []
 
         if diff_files:
             for i, df in enumerate(diff_files):
                 if i > 0:
                     self._diff.insert('end', '\n', 'context')
+                    self._minimap_lines.append(('context', ''))
                 self._positions[df.path] = self._diff.index('end-1c linestart')
                 name, idx = self._file_label(df)
                 self._diff.insert('end', f' {name}\n', 'filehdr')
+                self._minimap_lines.append(('filehdr', f' {name}'))
                 if idx:
                     self._diff.insert('end', f' {idx}\n', 'fileidx')
-
+                    self._minimap_lines.append(('fileidx', f' {idx}'))
                 for dl in df.lines:
                     if dl.kind != 'fileheader':
                         self._diff.insert('end', dl.text + '\n', dl.kind)
+                        self._minimap_lines.append((dl.kind, dl.text))
         else:
             self._diff.insert('end', 'Empty diff.\n', 'subdued')
 
@@ -380,6 +495,7 @@ class App:
             for path, pos in self._positions.items()
         )
         self.root.after_idle(self._update_sticky_header)
+        self.root.after_idle(self._render_minimap)
 
         # file list panel
         self._flist.configure(state='normal')
