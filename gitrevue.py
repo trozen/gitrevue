@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """gitrevue - lightweight Git diff viewer"""
 
+import re
 import subprocess
 import sys
 import tkinter as tk
@@ -18,6 +19,8 @@ Examples:
   git diff HEAD~5 | gitrevue              # last 5 commits
   git show HEAD | gitrevue                 # single commit
   git diff --first-parent main...HEAD | gitrevue
+
+  GITREVUE_SCALE=2 git diff HEAD | gitrevue   # scale UI up (HiDPI)
 """
 
 
@@ -109,28 +112,59 @@ def entries_from_diff(diff_files: list[DiffFile]) -> list[FileEntry]:
     return result
 
 
-# --colour scheme (catppuccin mocha) -----------------------------------------
+# --config -------------------------------------------------------------------
+
+class CFG:
+    font_family   = 'monospace'
+    font_size     = 12
+    window_scale  = 0.75    # fraction of screen size on startup
+    sash_ratio    = 0.70
+    scrollbar_w   = 28
+
+
+# --colour scheme (dracula) --------------------------------------------------
 
 C = {
-    'bg':            '#1e1e2e',
-    'fg':            '#cdd6f4',
-    'added_fg':      '#a6e3a1',
-    'added_bg':      '#0d1f0d',
-    'removed_fg':    '#f38ba8',
-    'removed_bg':    '#1f0d0d',
-    'hunk_fg':       '#f9e2af',
-    'fileheader_fg': '#89b4fa',
-    'subdued':       '#6c7086',
-    'topbar_bg':     '#181825',
-    'selected_bg':   '#313244',
-    'status_A':      '#a6e3a1',
-    'status_M':      '#89b4fa',
-    'status_D':      '#f38ba8',
-    'status_R':      '#cba6f7',
+    'bg':            '#282a36',
+    'fg':            '#f8f8f2',
+    'added_fg':      '#50fa7b',
+    'added_bg':      '#283636',
+    'removed_fg':    '#ff5555',
+    'removed_bg':    '#342a36',
+    'hunk_fg':       '#ffb86c',
+    'fileheader_fg': '#bd93f9',
+    'subdued':       '#6272a4',
+    'topbar_bg':     '#44475a',
+    'selected_bg':   '#44475a',
+    'status_A':      '#50fa7b',
+    'status_M':      '#bd93f9',
+    'status_D':      '#ff5555',
+    'status_R':      '#ff79c6',
 }
 
 
+
 # --application ------------------------------------------------------------
+
+def _primary_monitor_size() -> tuple[int, int]:
+    try:
+        out = subprocess.run(['xrandr', '--query'], capture_output=True, text=True,
+                             timeout=1).stdout
+        for line in out.splitlines():
+            if 'primary' in line:
+                m = re.search(r'(\d+)x(\d+)', line)
+                if m:
+                    return int(m.group(1)), int(m.group(2))
+        # no primary keyword: use the first connected monitor
+        for line in out.splitlines():
+            if ' connected' in line:
+                m = re.search(r'(\d+)x(\d+)', line)
+                if m:
+                    return int(m.group(1)), int(m.group(2))
+    except Exception:
+        pass
+    return 1920, 1080
+
 
 class App:
     def __init__(self, root: tk.Tk, diff_text: str) -> None:
@@ -144,20 +178,30 @@ class App:
 
     # --UI ------------------------------------------------------------
 
+    def _make_scrollbar(self, parent: tk.Widget, **kw) -> tk.Scrollbar:
+        return tk.Scrollbar(parent,
+                            bg=C['selected_bg'],
+                            troughcolor=C['bg'],
+                            activebackground=C['subdued'],
+                            relief='flat', bd=0,
+                            width=CFG.scrollbar_w,
+                            **kw)
+
     def _build_ui(self) -> None:
         self.root.configure(bg=C['bg'])
-        self.root.geometry('1200x800')
+        sw, sh = _primary_monitor_size()
+        w, h = int(sw * CFG.window_scale), int(sh * CFG.window_scale)
+        self.root.geometry(f'{w}x{h}')
+        font = (CFG.font_family, CFG.font_size)
 
         # top bar
         bar = tk.Frame(self.root, bg=C['topbar_bg'], pady=5)
         bar.pack(fill='x')
 
-        self._lbl_branch = tk.Label(bar, bg=C['topbar_bg'], fg=C['fg'],
-                                     font=('monospace', 10))
+        self._lbl_branch = tk.Label(bar, bg=C['topbar_bg'], fg=C['fg'], font=font)
         self._lbl_branch.pack(side='left', padx=10)
 
-        self._lbl_stat = tk.Label(bar, bg=C['topbar_bg'], fg=C['subdued'],
-                                   font=('monospace', 10))
+        self._lbl_stat = tk.Label(bar, bg=C['topbar_bg'], fg=C['subdued'], font=font)
         self._lbl_stat.pack(side='left')
 
         # two-panel split
@@ -165,31 +209,35 @@ class App:
                                      bg=C['subdued'], sashwidth=3, sashrelief='flat')
         self._sash.pack(fill='both', expand=True)
 
-        # left: diff
+        # left: diff (grid so the scrollbar corner square fits neatly)
         lf = tk.Frame(self._sash, bg=C['bg'])
+        lf.grid_rowconfigure(0, weight=1)
+        lf.grid_columnconfigure(0, weight=1)
         self._diff = tk.Text(lf, bg=C['bg'], fg=C['fg'],
-                              font=('monospace', 10), wrap='none',
+                              font=font, wrap='none',
                               relief='flat', bd=0, state='disabled', cursor='arrow',
                               selectbackground=C['selected_bg'])
-        vs = tk.Scrollbar(lf, orient='vertical',   command=self._diff.yview)
-        hs = tk.Scrollbar(lf, orient='horizontal', command=self._diff.xview)
+        vs = self._make_scrollbar(lf, orient='vertical',   command=self._diff.yview)
+        hs = self._make_scrollbar(lf, orient='horizontal', command=self._diff.xview)
         self._diff.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
-        vs.pack(side='right',  fill='y')
-        hs.pack(side='bottom', fill='x')
-        self._diff.pack(fill='both', expand=True)
+        self._diff.grid(row=0, column=0, sticky='nsew')
+        vs.grid(row=0, column=1, sticky='ns')
+        hs.grid(row=1, column=0, sticky='ew')
+        tk.Frame(lf, bg=C['topbar_bg'],
+                 width=CFG.scrollbar_w, height=CFG.scrollbar_w).grid(row=1, column=1)
 
         # right: file list
         rf = tk.Frame(self._sash, bg=C['bg'])
         self._flist = tk.Text(rf, bg=C['bg'], fg=C['fg'],
-                               font=('monospace', 10), wrap='none',
+                               font=font, wrap='none',
                                relief='flat', bd=0, state='disabled', cursor='arrow')
-        fvs = tk.Scrollbar(rf, orient='vertical', command=self._flist.yview)
+        fvs = self._make_scrollbar(rf, orient='vertical', command=self._flist.yview)
         self._flist.configure(yscrollcommand=fvs.set)
         fvs.pack(side='right', fill='y')
         self._flist.pack(fill='both', expand=True)
 
-        self._sash.add(lf)
-        self._sash.add(rf)
+        self._sash.add(lf, stretch='always')
+        self._sash.add(rf, stretch='never')
         self.root.after(50, self._init_sash)
 
         # diff tags
@@ -213,7 +261,7 @@ class App:
     def _init_sash(self) -> None:
         w = self._sash.winfo_width()
         if w > 1:
-            self._sash.sash_place(0, int(w * 0.70), 0)
+            self._sash.sash_place(0, int(w * CFG.sash_ratio), 0)
         else:
             self.root.after(50, self._init_sash)
 
@@ -295,6 +343,7 @@ class App:
 
 # --entry point ------------------------------------------------------------
 
+
 def main() -> None:
     if sys.stdin.isatty():
         print(USAGE, end='')
@@ -304,6 +353,8 @@ def main() -> None:
 
     root = tk.Tk()
     root.title('gitrevue')
+    root.bind('<Control-w>', lambda _: root.destroy())
+    root.bind('<Control-q>', lambda _: root.destroy())
     App(root, diff_text)
     root.mainloop()
 
