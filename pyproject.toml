@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gitrevue"
-version = "0.1.0"
+version = "0.1.0.dev0"
 description = "Lightweight Git diff viewer"
 requires-python = ">=3.10"
 

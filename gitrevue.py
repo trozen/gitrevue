@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """gitrevue - lightweight Git diff viewer"""
 
+import json
 import re
 import subprocess
 import sys
 import tkinter as tk
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
+
+_CONFIG_PATH = Path.home() / '.config' / 'gitrevue' / 'config.json'
 
 
 USAGE = """\
@@ -125,7 +129,7 @@ class CFG:
     sash_ratio    = 0.70
     scrollbar_w   = 28
     minimap_w     = 120
-    scroll_speed  = 12   # lines per mouse-wheel tick
+    scroll_speed  = 8   # lines per mouse-wheel tick
 
 
 # --colour scheme (dracula) --------------------------------------------------
@@ -216,6 +220,7 @@ class App:
         self._scroll_animating: bool = False
         self._flist_selected_row: int = -1
         self._manual_scroll: bool = False
+        self._wrap_var = tk.BooleanVar(value=self._load_config().get('wrap_lines', True))
 
         self._build_ui()
         self._load()
@@ -241,7 +246,19 @@ class App:
                             **kw)
 
     def _build_ui(self) -> None:
-        self.root.configure(bg=C['bg'])
+        menu_kw = dict(bg=C['topbar_bg'], fg=C['fg'],
+                       activebackground=C['selected_bg'], activeforeground=C['fg'],
+                       relief='flat', bd=0)
+        menubar = tk.Menu(self.root, **menu_kw)
+        file_menu = tk.Menu(menubar, tearoff=0, **menu_kw)
+        file_menu.add_command(label='Quit', accelerator='Ctrl+Q',
+                              command=self.root.destroy)
+        menubar.add_cascade(label='File', menu=file_menu)
+        view_menu = tk.Menu(menubar, tearoff=0, **menu_kw)
+        view_menu.add_checkbutton(label='Wrap long lines', variable=self._wrap_var,
+                                  command=self._on_wrap_toggle)
+        menubar.add_cascade(label='View', menu=view_menu)
+        self.root.configure(bg=C['bg'], menu=menubar)
         sw, sh = _primary_monitor_size()
         w, h = int(sw * CFG.window_scale), int(sh * CFG.window_scale)
         self.root.geometry(f'{w}x{h}')
@@ -272,7 +289,7 @@ class App:
         self._sticky.grid(row=0, column=0, columnspan=3, sticky='ew')
 
         self._diff = tk.Text(lf, bg=C['bg'], fg=C['fg'],
-                              font=font, wrap='none',
+                              font=font, wrap='char',
                               relief='flat', bd=0, cursor='arrow',
                               selectbackground=C['selected_bg'],
                               selectforeground=C['fg'])
@@ -296,8 +313,13 @@ class App:
 
         self._diff_vs.grid(row=1, column=2, sticky='ns')
         hs.grid(row=2, column=0, sticky='ew')
-        tk.Frame(lf, bg=C['topbar_bg'],
-                 width=CFG.scrollbar_w, height=CFG.scrollbar_w).grid(row=2, column=2)
+        corner = tk.Frame(lf, bg=C['topbar_bg'], width=CFG.scrollbar_w, height=CFG.scrollbar_w)
+        corner.grid(row=2, column=2)
+        self._diff_hs = hs
+        self._diff_hs_corner = corner
+        # wrap on by default — horizontal scrollbar not needed
+        hs.grid_remove()
+        corner.grid_remove()
 
         # right: file list
         rf = tk.Frame(self._sash, bg=C['bg'])
@@ -343,6 +365,34 @@ class App:
         self._flist.bind('<B1-Motion>', lambda e: 'break')
         self._flist.bind('<Double-Button-1>', lambda e: 'break')
         self._flist.bind('<Triple-Button-1>', lambda e: 'break')
+        self._on_wrap_toggle()
+
+    def _on_wrap_toggle(self) -> None:
+        wrap = self._wrap_var.get()
+        if wrap:
+            self._diff.configure(wrap='char')
+            self._diff_hs.grid_remove()
+            self._diff_hs_corner.grid_remove()
+        else:
+            self._diff.configure(wrap='none')
+            self._diff_hs.grid()
+            self._diff_hs_corner.grid()
+        self._save_config({'wrap_lines': wrap})
+
+    @staticmethod
+    def _load_config() -> dict:
+        try:
+            return json.loads(_CONFIG_PATH.read_text())
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _save_config(data: dict) -> None:
+        try:
+            _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _CONFIG_PATH.write_text(json.dumps(data))
+        except Exception:
+            pass
 
     def _init_sash(self) -> None:
         w = self._sash.winfo_width()
