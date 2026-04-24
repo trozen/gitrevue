@@ -258,6 +258,12 @@ class App:
         view_menu.add_checkbutton(label='Wrap long lines', variable=self._wrap_var,
                                   command=self._on_wrap_toggle)
         menubar.add_cascade(label='View', menu=view_menu)
+        go_menu = tk.Menu(menubar, tearoff=0, **menu_kw)
+        go_menu.add_command(label='Next file',     accelerator='n / Tab',
+                            command=lambda: self._jump_to_adjacent_file(1))
+        go_menu.add_command(label='Previous file', accelerator='p / Shift+Tab',
+                            command=lambda: self._jump_to_adjacent_file(-1))
+        menubar.add_cascade(label='Go', menu=go_menu)
         self.root.configure(bg=C['bg'], menu=menubar)
         sw, sh = _primary_monitor_size()
         w, h = int(sw * CFG.window_scale), int(sh * CFG.window_scale)
@@ -295,9 +301,20 @@ class App:
                               selectforeground=C['fg'])
         self._make_read_only(self._diff)
         self._diff.bind('<Configure>', self._on_diff_configure)
-        self._diff.bind('<Button-4>',  lambda e: self._on_wheel(-1) or 'break')
-        self._diff.bind('<Button-5>',  lambda e: self._on_wheel( 1) or 'break')
+        self._diff.bind('<Button-4>',   lambda e: self._on_wheel(-1) or 'break')
+        self._diff.bind('<Button-5>',   lambda e: self._on_wheel( 1) or 'break')
         self._diff.bind('<MouseWheel>', lambda e: self._on_wheel(-e.delta // 120) or 'break')
+        self._diff.bind('<Up>',    lambda e: self._on_wheel(-1) or 'break')
+        self._diff.bind('<Down>',  lambda e: self._on_wheel( 1) or 'break')
+        self._diff.bind('<Prior>', lambda e: self._on_page_scroll(-1) or 'break')
+        self._diff.bind('<Next>',  lambda e: self._on_page_scroll( 1) or 'break')
+        self._diff.bind('<Home>',  lambda e: self._scroll_to(0.0) or 'break')
+        self._diff.bind('<End>',   lambda e: self._scroll_to(1.0) or 'break')
+        self._diff.bind('n',              lambda e: self._jump_to_adjacent_file( 1) or 'break')
+        self._diff.bind('p',              lambda e: self._jump_to_adjacent_file(-1) or 'break')
+        self._diff.bind('<Tab>',          lambda e: self._jump_to_adjacent_file( 1) or 'break')
+        self._diff.bind('<Shift-Tab>',      lambda e: self._jump_to_adjacent_file(-1) or 'break')
+        self._diff.bind('<ISO_Left_Tab>',   lambda e: self._jump_to_adjacent_file(-1) or 'break')
         self._diff_vs = self._make_scrollbar(lf, orient='vertical', command=self._diff.yview)
         self._diff_vs.bind('<ButtonPress-1>', lambda e: setattr(self, '_manual_scroll', True))
         hs = self._make_scrollbar(lf, orient='horizontal', command=self._diff.xview)
@@ -413,18 +430,33 @@ class App:
 
     # --smooth scroll ---------------------------------------------------------
 
+    def _scroll_by(self, frac: float) -> None:
+        first, last = self._diff.yview()
+        max_pos = 1.0 - (last - first)
+        self._manual_scroll = True
+        self._scroll_target = max(0.0, min(max_pos, self._scroll_target + frac))
+        if not self._scroll_animating:
+            self._scroll_animating = True
+            self._animate_scroll()
+
     def _on_wheel(self, ticks: int) -> None:
         total = int(self._diff.index('end').split('.')[0])
         if total < 2:
             return
-        self._manual_scroll = True
+        self._scroll_by((CFG.scroll_speed * ticks) / total)
+
+    def _scroll_to(self, pos: float) -> None:
         first, last = self._diff.yview()
-        max_pos = 1.0 - (last - first)  # true bottom: yview[0] never exceeds this
-        step = (CFG.scroll_speed * ticks) / total
-        self._scroll_target = max(0.0, min(max_pos, self._scroll_target + step))
+        max_pos = 1.0 - (last - first)
+        self._manual_scroll = True
+        self._scroll_target = max_pos if pos >= 1.0 else 0.0
         if not self._scroll_animating:
             self._scroll_animating = True
             self._animate_scroll()
+
+    def _on_page_scroll(self, direction: int) -> None:
+        first, last = self._diff.yview()
+        self._scroll_by(direction * (last - first))
 
     def _animate_scroll(self) -> None:
         current = self._diff.yview()[0]
@@ -573,6 +605,7 @@ class App:
 
         self._entries = entries
         self._render(branch, stat, diff_files, entries)
+        self._diff.focus_set()
 
     def _render(self, branch: str, stat: str,
                 diff_files: list[DiffFile], entries: list[FileEntry]) -> None:
@@ -640,6 +673,8 @@ class App:
             self._flist.insert('end', '\n')
 
         self._flist.configure(state='disabled')
+        if entries:
+            self._highlight_row(1)
 
     # --interaction ----------------------------------------------------------
 
@@ -654,6 +689,32 @@ class App:
         self._flist_selected_row = row
         self._flist.tag_remove('selected', '1.0', 'end')
         self._flist.tag_add('selected', f'{row}.0', f'{row}.end+1c')
+
+    def _jump_to_adjacent_file(self, offset: int) -> None:
+        if not self._entries:
+            return
+        if self._flist_selected_row > 0:
+            idx = self._flist_selected_row - 1
+        elif self._pos_order:
+            top = int(self._diff.index('@0,0').split('.')[0])
+            path = self._pos_order[0][1]
+            for line_no, p in self._pos_order:
+                if line_no <= top:
+                    path = p
+                else:
+                    break
+            paths = [e.path for e in self._entries]
+            try:
+                idx = paths.index(path)
+            except ValueError:
+                return
+        else:
+            return
+        target = idx + offset
+        if 0 <= target < len(self._entries):
+            self._highlight_row(target + 1)
+            self._jump_to(self._entries[target].path)
+            self._diff.focus_set()
 
     def _jump_to(self, path: str) -> None:
         self._manual_scroll = False
