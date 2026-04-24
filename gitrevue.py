@@ -44,6 +44,9 @@ class DiffLine:
 class DiffFile:
     path: str
     lines: list[DiffLine] = field(default_factory=list)
+    status: str = 'M'
+    old_path: str = ''
+    index: str = ''
 
 
 # --git helpers ------------------------------------------------------------
@@ -86,7 +89,18 @@ def parse_diff(text: str) -> list[DiffFile]:
             path = raw[b_idx + 3:] if b_idx != -1 else 'unknown'
             current = DiffFile(path)
         if current is not None:
-            current.lines.append(DiffLine(raw, _classify(raw)))
+            dl = DiffLine(raw, _classify(raw))
+            current.lines.append(dl)
+            if dl.kind == 'fileheader':
+                if raw.startswith('new file'):
+                    current.status = 'A'
+                elif raw.startswith('deleted file'):
+                    current.status = 'D'
+                elif raw.startswith('rename from '):
+                    current.status = 'R'
+                    current.old_path = raw[len('rename from '):]
+                elif raw.startswith('index '):
+                    current.index = raw
 
     if current is not None:
         files.append(current)
@@ -94,22 +108,12 @@ def parse_diff(text: str) -> list[DiffFile]:
 
 
 def entries_from_diff(diff_files: list[DiffFile]) -> list[FileEntry]:
-    result = []
-    for df in diff_files:
-        add = sum(1 for l in df.lines if l.kind == 'added')
-        rem = sum(1 for l in df.lines if l.kind == 'removed')
-        # derive status from diff metadata lines
-        status = 'M'
-        for l in df.lines:
-            if l.kind == 'fileheader':
-                if l.text.startswith('new file'):
-                    status = 'A'
-                elif l.text.startswith('deleted file'):
-                    status = 'D'
-                elif l.text.startswith('rename '):
-                    status = 'R'
-        result.append(FileEntry(df.path, status, add, rem))
-    return result
+    return [
+        FileEntry(df.path, df.status,
+                  sum(1 for l in df.lines if l.kind == 'added'),
+                  sum(1 for l in df.lines if l.kind == 'removed'))
+        for df in diff_files
+    ]
 
 
 # --config -------------------------------------------------------------------
@@ -171,7 +175,9 @@ class App:
         self.root = root
         self.diff_text = diff_text
         self._entries: list[FileEntry] = []
+        self._diff_files: list[DiffFile] = []
         self._positions: dict[str, str] = {}
+        self._pos_order: list[tuple[int, str]] = []
 
         self._build_ui()
         self._load()
@@ -220,22 +226,27 @@ class App:
 
         # left: diff (grid so the scrollbar corner square fits neatly)
         lf = tk.Frame(self._sash, bg=C['bg'])
-        lf.grid_rowconfigure(0, weight=1)
+        lf.grid_rowconfigure(1, weight=1)
         lf.grid_columnconfigure(0, weight=1)
+
+        self._sticky = tk.Label(lf, bg=C['topbar_bg'], fg=C['fg'],
+                                 font=font, anchor='w', padx=10, pady=3, text='')
+        self._sticky.grid(row=0, column=0, columnspan=2, sticky='ew')
+
         self._diff = tk.Text(lf, bg=C['bg'], fg=C['fg'],
                               font=font, wrap='none',
                               relief='flat', bd=0, cursor='arrow',
                               selectbackground=C['selected_bg'],
                               selectforeground=C['fg'])
         self._make_read_only(self._diff)
-        vs = self._make_scrollbar(lf, orient='vertical',   command=self._diff.yview)
+        self._diff_vs = self._make_scrollbar(lf, orient='vertical', command=self._diff.yview)
         hs = self._make_scrollbar(lf, orient='horizontal', command=self._diff.xview)
-        self._diff.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
-        self._diff.grid(row=0, column=0, sticky='nsew')
-        vs.grid(row=0, column=1, sticky='ns')
-        hs.grid(row=1, column=0, sticky='ew')
+        self._diff.configure(yscrollcommand=self._on_diff_yscroll, xscrollcommand=hs.set)
+        self._diff.grid(row=1, column=0, sticky='nsew')
+        self._diff_vs.grid(row=1, column=1, sticky='ns')
+        hs.grid(row=2, column=0, sticky='ew')
         tk.Frame(lf, bg=C['topbar_bg'],
-                 width=CFG.scrollbar_w, height=CFG.scrollbar_w).grid(row=1, column=1)
+                 width=CFG.scrollbar_w, height=CFG.scrollbar_w).grid(row=2, column=1)
 
         # right: file list
         rf = tk.Frame(self._sash, bg=C['bg'])
@@ -258,6 +269,12 @@ class App:
         self._diff.tag_configure('fileheader',  foreground=C['fileheader_fg'])
         self._diff.tag_configure('context',     foreground=C['fg'])
         self._diff.tag_configure('subdued',     foreground=C['subdued'])
+        self._diff.tag_configure('filehdr',     foreground=C['fileheader_fg'], background=C['topbar_bg'])
+        self._diff.tag_configure('fileidx',     foreground=C['fileheader_fg'], background=C['topbar_bg'])
+        self._diff.tag_configure('status_A',    foreground=C['status_A'])
+        self._diff.tag_configure('status_M',    foreground=C['status_M'])
+        self._diff.tag_configure('status_D',    foreground=C['status_D'])
+        self._diff.tag_configure('status_R',    foreground=C['status_R'])
 
         # file list tags
         self._flist.tag_configure('status_A',  foreground=C['status_A'])
@@ -288,6 +305,34 @@ class App:
         if w > 1:
             self._sash.sash_place(0, int(w * CFG.sash_ratio), 0)
 
+    @staticmethod
+    def _file_label(df: DiffFile) -> tuple[str, str]:
+        """Return (name_line, index_line) for both the sticky label and the diff header."""
+        name = f'{df.old_path} -> {df.path}' if (df.status == 'R' and df.old_path) else df.path
+        return name, df.index
+
+    def _on_diff_yscroll(self, first: str, last: str) -> None:
+        self._diff_vs.set(first, last)
+        self._update_sticky_header()
+
+    def _update_sticky_header(self) -> None:
+        if not self._pos_order:
+            self._sticky.configure(text='')
+            return
+        top = int(self._diff.index('@0,0').split('.')[0])
+        path = self._pos_order[0][1]
+        for line_no, p in self._pos_order:
+            if line_no <= top:
+                path = p
+            else:
+                break
+        df = next((d for d in self._diff_files if d.path == path), None)
+        if df is None:
+            return
+        name, idx = self._file_label(df)
+        self._sticky.configure(text=f' {name}\n {idx}' if idx else f' {name}\n',
+                               fg=C['fileheader_fg'], justify='left')
+
     # --data ------------------------------------------------------------
 
     def _load(self) -> None:
@@ -308,17 +353,33 @@ class App:
         self._lbl_branch.configure(text=f'branch:  {branch}' if branch else '')
         self._lbl_stat.configure(text=f'  {stat}' if stat else '')
 
+        self._diff_files = diff_files
+
         # diff panel
         self._diff.delete('1.0', 'end')
         self._positions.clear()
 
         if diff_files:
-            for df in diff_files:
+            for i, df in enumerate(diff_files):
+                if i > 0:
+                    self._diff.insert('end', '\n', 'context')
                 self._positions[df.path] = self._diff.index('end-1c linestart')
+                name, idx = self._file_label(df)
+                self._diff.insert('end', f' {name}\n', 'filehdr')
+                if idx:
+                    self._diff.insert('end', f' {idx}\n', 'fileidx')
+
                 for dl in df.lines:
-                    self._diff.insert('end', dl.text + '\n', dl.kind)
+                    if dl.kind != 'fileheader':
+                        self._diff.insert('end', dl.text + '\n', dl.kind)
         else:
             self._diff.insert('end', 'Empty diff.\n', 'subdued')
+
+        self._pos_order = sorted(
+            (int(pos.split('.')[0]), path)
+            for path, pos in self._positions.items()
+        )
+        self.root.after_idle(self._update_sticky_header)
 
         # file list panel
         self._flist.configure(state='normal')
