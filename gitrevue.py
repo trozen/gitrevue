@@ -214,6 +214,8 @@ class App:
         self._hunk_seps: list[tk.Canvas] = []
         self._scroll_target: float = 0.0
         self._scroll_animating: bool = False
+        self._flist_selected_row: int = -1
+        self._manual_scroll: bool = False
 
         self._build_ui()
         self._load()
@@ -280,6 +282,7 @@ class App:
         self._diff.bind('<Button-5>',  lambda e: self._on_wheel( 1) or 'break')
         self._diff.bind('<MouseWheel>', lambda e: self._on_wheel(-e.delta // 120) or 'break')
         self._diff_vs = self._make_scrollbar(lf, orient='vertical', command=self._diff.yview)
+        self._diff_vs.bind('<ButtonPress-1>', lambda e: setattr(self, '_manual_scroll', True))
         hs = self._make_scrollbar(lf, orient='horizontal', command=self._diff.xview)
         self._diff.configure(yscrollcommand=self._on_diff_yscroll, xscrollcommand=hs.set)
         self._diff.grid(row=1, column=0, sticky='nsew')
@@ -300,7 +303,9 @@ class App:
         rf = tk.Frame(self._sash, bg=C['bg'])
         self._flist = tk.Text(rf, bg=C['bg'], fg=C['fg'],
                                font=font, wrap='none',
-                               relief='flat', bd=0, state='disabled', cursor='arrow')
+                               relief='flat', bd=0, state='disabled', cursor='arrow',
+                               selectbackground=C['bg'], selectforeground=C['fg'],
+                               inactiveselectbackground=C['bg'])
         fvs = self._make_scrollbar(rf, orient='vertical', command=self._flist.yview)
         self._flist.configure(yscrollcommand=fvs.set)
         fvs.pack(side='right', fill='y')
@@ -335,6 +340,9 @@ class App:
         self._diff.tag_raise('sel')
 
         self._flist.bind('<Button-1>', self._on_file_click)
+        self._flist.bind('<B1-Motion>', lambda e: 'break')
+        self._flist.bind('<Double-Button-1>', lambda e: 'break')
+        self._flist.bind('<Triple-Button-1>', lambda e: 'break')
 
     def _init_sash(self) -> None:
         w = self._sash.winfo_width()
@@ -359,6 +367,7 @@ class App:
         total = int(self._diff.index('end').split('.')[0])
         if total < 2:
             return
+        self._manual_scroll = True
         first, last = self._diff.yview()
         max_pos = 1.0 - (last - first)  # true bottom: yview[0] never exceeds this
         step = (CFG.scroll_speed * ticks) / total
@@ -456,6 +465,7 @@ class App:
         h = self._minimap_content_h
         if h <= 0:
             return
+        self._manual_scroll = True
         first, last = self._scroll_pos
         span = last - first
         frac = max(0.0, min(1.0 - span, event.y / h - span / 2))
@@ -492,6 +502,12 @@ class App:
         name, idx = self._file_label(df)
         self._sticky.configure(text=f' {name}\n {idx}' if idx else f' {name}\n',
                                fg=C['fileheader_fg'], justify='left')
+        if not self._manual_scroll:
+            return
+        row = next((i + 1 for i, e in enumerate(self._entries) if e.path == path), -1)
+        if row > 0 and row != self._flist_selected_row:
+            self._highlight_row(row)
+            self._flist.see(f'{row}.0')
 
     # --data ------------------------------------------------------------
 
@@ -557,6 +573,7 @@ class App:
         self.root.after_idle(self._update_hunk_sep_widths)
 
         # file list panel
+        self._flist_selected_row = -1
         self._flist.configure(state='normal')
         self._flist.delete('1.0', 'end')
 
@@ -584,10 +601,12 @@ class App:
             self._jump_to(self._entries[row].path)
 
     def _highlight_row(self, row: int) -> None:
+        self._flist_selected_row = row
         self._flist.tag_remove('selected', '1.0', 'end')
         self._flist.tag_add('selected', f'{row}.0', f'{row}.end+1c')
 
     def _jump_to(self, path: str) -> None:
+        self._manual_scroll = False
         pos = self._positions.get(path)
         if not pos:
             return
