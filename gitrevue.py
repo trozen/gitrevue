@@ -121,6 +121,68 @@ def entries_from_diff(diff_files: list[DiffFile]) -> list[FileEntry]:
     ]
 
 
+def _build_tree_rows(
+    entries: list[FileEntry],
+) -> list[tuple[str, int, 'FileEntry | None']]:
+    """Return flat render list for tree view: (label, depth, entry_or_None).
+
+    Directories with a single subdirectory and no files are folded into their
+    child, so e.g. src/ -> main/ -> foo.py becomes ('src/main/', 0, None).
+    Children at each level are ordered by their earliest position in the
+    original entry list so tree order matches the diff panel order.
+    """
+    trie: dict = {}
+    for i, e in enumerate(entries):
+        parts = e.path.split('/')
+        node = trie
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = (i, e)  # leaf stores original index for ordering
+
+    rows: list[tuple[str, int, 'FileEntry | None']] = []
+    _walk_trie(trie, rows, 0, '')
+    return rows
+
+
+def _trie_min_idx(node: dict) -> int:
+    best = 10 ** 9
+    for v in node.values():
+        if isinstance(v, tuple):
+            best = min(best, v[0])
+        elif isinstance(v, dict):
+            best = min(best, _trie_min_idx(v))
+    return best
+
+
+def _walk_trie(node: dict, rows: list, depth: int, dir_label: str) -> None:
+    leaves = [(k, v) for k, v in node.items() if isinstance(v, tuple)]
+    dirs   = [(k, v) for k, v in node.items() if isinstance(v, dict)]
+
+    # Fold single-child dir chains that contain no files.
+    if not leaves and len(dirs) == 1:
+        name, child = dirs[0]
+        _walk_trie(child, rows, depth, dir_label + name + '/')
+        return
+
+    if dir_label:
+        rows.append((dir_label, depth, None))
+        depth += 1
+
+    # Interleave files and subdirs in original diff order.
+    children: list[tuple[int, str, 'FileEntry | None', 'dict | None']] = []
+    for name, (idx, entry) in leaves:
+        children.append((idx, name, entry, None))
+    for name, child in dirs:
+        children.append((_trie_min_idx(child), name, None, child))
+    children.sort(key=lambda x: x[0])
+
+    for _, name, entry, child in children:
+        if entry is not None:
+            rows.append((name, depth, entry))
+        else:
+            _walk_trie(child, rows, depth, name + '/')
+
+
 # --config -------------------------------------------------------------------
 
 class CFG:
@@ -220,8 +282,12 @@ class App:
         self._scroll_target: float = 0.0
         self._scroll_animating: bool = False
         self._flist_selected_row: int = -1
+        self._flist_row_to_entry: list[FileEntry | None] = []
+        self._flist_path_to_row: dict[str, int] = {}
         self._manual_scroll: bool = False
-        self._wrap_var = tk.BooleanVar(value=self._load_config().get('wrap_lines', True))
+        cfg = self._load_config()
+        self._wrap_var = tk.BooleanVar(value=cfg.get('wrap_lines', True))
+        self._tree_var = tk.BooleanVar(value=cfg.get('tree_view', False))
 
         self._build_ui()
         self._load()
@@ -258,6 +324,8 @@ class App:
         view_menu = tk.Menu(menubar, tearoff=0, **menu_kw)
         view_menu.add_checkbutton(label='Wrap long lines', variable=self._wrap_var,
                                   command=self._on_wrap_toggle)
+        view_menu.add_checkbutton(label='Tree view', variable=self._tree_var,
+                                  command=self._on_tree_toggle)
         menubar.add_cascade(label='View', menu=view_menu)
         go_menu = tk.Menu(menubar, tearoff=0, **menu_kw)
         go_menu.add_command(label='Next file',     accelerator='n / Tab',
@@ -375,6 +443,7 @@ class App:
         self._flist.tag_configure('status_D',  foreground=C['status_D'])
         self._flist.tag_configure('status_R',  foreground=C['status_R'])
         self._flist.tag_configure('stats',     foreground=C['subdued'])
+        self._flist.tag_configure('dir',       foreground=C['subdued'])
         self._flist.tag_configure('selected',  background=C['selected_bg'])
 
         self._diff.tag_raise('sel')
@@ -383,6 +452,12 @@ class App:
         self._flist.bind('<B1-Motion>', lambda e: 'break')
         self._flist.bind('<Double-Button-1>', lambda e: 'break')
         self._flist.bind('<Triple-Button-1>', lambda e: 'break')
+        self._flist.bind('<Button-4>',   lambda e: self._flist.yview_scroll(-4, 'units') or 'break')
+        self._flist.bind('<Button-5>',   lambda e: self._flist.yview_scroll( 4, 'units') or 'break')
+        self._flist.bind('<MouseWheel>', lambda e: self._flist.yview_scroll(-e.delta // 30, 'units') or 'break')
+        self._flist.bind('<Up>',         lambda e: self._flist_nav(-1) or 'break')
+        self._flist.bind('<Down>',       lambda e: self._flist_nav( 1) or 'break')
+        self._flist.bind('<Return>',     lambda e: self._flist_activate() or 'break')
         self._on_wrap_toggle()
 
     def _on_wrap_toggle(self) -> None:
@@ -397,6 +472,10 @@ class App:
             self._diff_hs_corner.grid()
         self._save_config({'wrap_lines': wrap})
 
+    def _on_tree_toggle(self) -> None:
+        self._save_config({'tree_view': self._tree_var.get()})
+        self._render_flist(self._entries)
+
     @staticmethod
     def _load_config() -> dict:
         try:
@@ -408,7 +487,9 @@ class App:
     def _save_config(data: dict) -> None:
         try:
             _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            _CONFIG_PATH.write_text(json.dumps(data))
+            existing = App._load_config()
+            existing.update(data)
+            _CONFIG_PATH.write_text(json.dumps(existing))
         except Exception:
             pass
 
@@ -587,10 +668,9 @@ class App:
                                fg=C['fileheader_fg'], justify='left')
         if not self._manual_scroll:
             return
-        row = next((i + 1 for i, e in enumerate(self._entries) if e.path == path), -1)
+        row = self._flist_path_to_row.get(path, -1)
         if row > 0 and row != self._flist_selected_row:
             self._highlight_row(row)
-            self._flist.see(f'{row}.0')
 
     # --data ------------------------------------------------------------
 
@@ -630,7 +710,7 @@ class App:
                     self._minimap_lines.append(('context', ''))
                 name, idx = self._file_label(df)
                 self._diff.insert('end', f' {name}\n', 'filehdr')
-                self._positions[df.path] = self._diff.index('end-1c linestart')
+                self._positions[df.path] = self._diff.index('end-2c linestart')
                 self._minimap_lines.append(('filehdr', f' {name}'))
                 if idx:
                     self._diff.insert('end', f' {idx}\n', 'fileidx')
@@ -656,46 +736,95 @@ class App:
         self.root.after_idle(self._render_minimap)
         self.root.after_idle(self._update_hunk_sep_widths)
 
-        # file list panel
+        self._render_flist(entries)
+
+    def _render_flist(self, entries: list[FileEntry]) -> None:
         self._flist_selected_row = -1
+        self._flist_row_to_entry = []
+        self._flist_path_to_row = {}
         self._flist.configure(state='normal')
         self._flist.delete('1.0', 'end')
 
-        for e in entries:
-            self._flist.insert('end', f' {e.status} ', f'status_{e.status}')
-            self._flist.insert('end', f' {e.path}')
-            parts: list[str] = []
-            if e.additions:
-                parts.append(f'+{e.additions}')
-            if e.deletions:
-                parts.append(f'-{e.deletions}')
-            if parts:
-                self._flist.insert('end', f'  {" ".join(parts)}', 'stats')
-            self._flist.insert('end', '\n')
+        if self._tree_var.get():
+            rows = _build_tree_rows(entries)
+            for label, depth, entry in rows:
+                indent = '  ' * depth
+                if entry is None:
+                    self._flist.insert('end', f'{indent}{label}\n', 'dir')
+                    self._flist_row_to_entry.append(None)
+                else:
+                    stats: list[str] = []
+                    if entry.additions:
+                        stats.append(f'+{entry.additions}')
+                    if entry.deletions:
+                        stats.append(f'-{entry.deletions}')
+                    self._flist.insert('end', f'{indent}', 'dir')
+                    self._flist.insert('end', f'{entry.status} ', f'status_{entry.status}')
+                    self._flist.insert('end', label)
+                    if stats:
+                        self._flist.insert('end', f'  {" ".join(stats)}', 'stats')
+                    self._flist.insert('end', '\n')
+                    display_row = len(self._flist_row_to_entry) + 1
+                    self._flist_path_to_row[entry.path] = display_row
+                    self._flist_row_to_entry.append(entry)
+        else:
+            for e in entries:
+                parts: list[str] = []
+                if e.additions:
+                    parts.append(f'+{e.additions}')
+                if e.deletions:
+                    parts.append(f'-{e.deletions}')
+                self._flist.insert('end', f' {e.status} ', f'status_{e.status}')
+                self._flist.insert('end', f' {e.path}')
+                if parts:
+                    self._flist.insert('end', f'  {" ".join(parts)}', 'stats')
+                self._flist.insert('end', '\n')
+                display_row = len(self._flist_row_to_entry) + 1
+                self._flist_path_to_row[e.path] = display_row
+                self._flist_row_to_entry.append(e)
 
         self._flist.configure(state='disabled')
         if entries:
-            self._highlight_row(1)
+            first_file_row = next(
+                (i + 1 for i, e in enumerate(self._flist_row_to_entry) if e is not None), -1
+            )
+            if first_file_row > 0:
+                self._highlight_row(first_file_row)
 
     # --interaction ----------------------------------------------------------
 
+    def _flist_nav(self, offset: int) -> None:
+        self._jump_to_adjacent_file(offset)
+        self._flist.focus_set()
+
+    def _flist_activate(self) -> None:
+        if self._flist_selected_row > 0:
+            entry = self._flist_row_to_entry[self._flist_selected_row - 1]
+            if entry is not None:
+                self._jump_to(entry.path)
+                self._diff.focus_set()
+
     def _on_file_click(self, event: tk.Event) -> None:
         idx = self._flist.index(f'@{event.x},{event.y}')
-        row = int(idx.split('.')[0]) - 1
-        if 0 <= row < len(self._entries):
-            self._highlight_row(row + 1)
-            self._jump_to(self._entries[row].path)
+        row_0 = int(idx.split('.')[0]) - 1
+        if 0 <= row_0 < len(self._flist_row_to_entry):
+            entry = self._flist_row_to_entry[row_0]
+            if entry is not None:
+                self._highlight_row(row_0 + 1)
+                self._jump_to(entry.path)
 
     def _highlight_row(self, row: int) -> None:
         self._flist_selected_row = row
         self._flist.tag_remove('selected', '1.0', 'end')
         self._flist.tag_add('selected', f'{row}.0', f'{row}.end+1c')
+        self._flist.see(f'{row}.0')
 
     def _jump_to_adjacent_file(self, offset: int) -> None:
         if not self._entries:
             return
+        cur_entry: FileEntry | None = None
         if self._flist_selected_row > 0:
-            idx = self._flist_selected_row - 1
+            cur_entry = self._flist_row_to_entry[self._flist_selected_row - 1]
         elif self._pos_order:
             top = int(self._diff.index('@0,0').split('.')[0])
             path = self._pos_order[0][1]
@@ -704,17 +833,21 @@ class App:
                     path = p
                 else:
                     break
-            paths = [e.path for e in self._entries]
-            try:
-                idx = paths.index(path)
-            except ValueError:
-                return
-        else:
+            cur_entry = next((e for e in self._entries if e.path == path), None)
+        if cur_entry is None:
+            return
+        paths = [e.path for e in self._entries]
+        try:
+            idx = paths.index(cur_entry.path)
+        except ValueError:
             return
         target = idx + offset
         if 0 <= target < len(self._entries):
-            self._highlight_row(target + 1)
-            self._jump_to(self._entries[target].path)
+            target_entry = self._entries[target]
+            display_row = self._flist_path_to_row.get(target_entry.path, -1)
+            if display_row > 0:
+                self._highlight_row(display_row)
+            self._jump_to(target_entry.path)
             self._diff.focus_set()
 
     def _jump_to(self, path: str) -> None:
@@ -722,7 +855,10 @@ class App:
         pos = self._positions.get(path)
         if not pos:
             return
-        self._diff.yview(pos)
+        df = next((d for d in self._diff_files if d.path == path), None)
+        header_lines = 2 if (df and df.index) else 1
+        line = int(pos.split('.')[0]) + header_lines
+        self._diff.yview(f'{line}.0')
 
 
 # --entry point ------------------------------------------------------------
