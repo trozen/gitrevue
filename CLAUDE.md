@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`gitrevue` is a single-file (`gitrevue.py`) pipe-only Git diff viewer using Python 3.10+ and Tkinter (stdlib only, zero extra dependencies). It is installed as a CLI tool via `uv`.
+`gitr` is a single-file (`gitr.py`) pipe-only Git diff viewer using Python 3.10+ and Tkinter (stdlib only, zero extra dependencies). It is installed as a CLI tool via `uv`.
 
 ## Commands
 
@@ -13,23 +13,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 uv tool install --reinstall .
 
 # Run without installing
-uv run gitrevue
+uv run gitr
 
 # Use it
-git diff main...HEAD | gitrevue
-git diff HEAD | gitrevue
-git diff --cached | gitrevue
-git show HEAD | gitrevue
+git diff main...HEAD | gitr
+git diff HEAD | gitr
+git diff --cached | gitr
+git show HEAD | gitr
 ```
 
 No test suite yet. Syntax check:
 ```bash
-python3 -c "import ast; ast.parse(open('gitrevue.py').read())"
+python3 -c "import ast; ast.parse(open('gitr.py').read())"
 ```
 
 ## Architecture
 
-Everything lives in `gitrevue.py`. The flow is:
+Everything lives in `gitr.py`. The flow is:
 
 1. `main()` reads all of stdin; if stdin is a tty, prints usage and exits.
 2. `parse_diff(text)` splits the raw diff into `DiffFile` objects, each holding a list of `DiffLine(text, kind)` where `kind` is one of `added | removed | context | hunk | fileheader`.

@@ -3,6 +3,6 @@ revision = 3
 requires-python = ">=3.10"
 
 [[package]]
-name = "gitrevue"
+name = "gitr"
 version = "0.1.0.dev0"
 source = { editable = "." }

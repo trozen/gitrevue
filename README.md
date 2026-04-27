@@ -1,4 +1,4 @@
-# gitrevue
+# gitr
 
 Lightweight terminal-launched Git diff viewer. Two-panel GUI: coloured diff on the left, clickable file list on the right.
 
@@ -11,14 +11,14 @@ uv tool install .
 ## Usage
 
 ```bash
-gitrevue                         # git diff (unstaged changes)
-gitrevue master                  # git diff master (to working tree)
-gitrevue --merge-base master     # diff from common ancestor to working tree
-gitrevue master HEAD             # git diff master HEAD (committed only)
+gitr                         # git diff (unstaged changes)
+gitr master                  # git diff master (to working tree)
+gitr --merge-base master     # diff from common ancestor to working tree
+gitr master HEAD             # git diff master HEAD (committed only)
 
-git diff | gitrevue              # pipe a patch
-gitrevue -                       # read stdin explicitly
-gitrevue -p patch.diff           # read from a patch file
+git diff | gitr              # pipe a patch
+gitr -                       # read stdin explicitly
+gitr -p patch.diff           # read from a patch file
 ```
 
 ## Requirements

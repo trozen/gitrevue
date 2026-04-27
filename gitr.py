@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""gitrevue - lightweight Git diff viewer"""
+"""gitr - lightweight Git diff viewer"""
 
 import argparse
 import difflib
@@ -13,20 +13,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-_CONFIG_PATH = Path.home() / '.config' / 'gitrevue' / 'config.json'
+_CONFIG_PATH = Path.home() / '.config' / 'gitr' / 'config.json'
 
 
 USAGE = """\
 usage:
-  gitrevue                         # git diff (unstaged changes)
-  gitrevue master                  # git diff master (to working tree)
-  gitrevue --merge-base master     # diff from common ancestor to working tree
-  gitrevue master HEAD             # git diff master HEAD (committed only)
-  git diff | gitrevue              # pipe a patch
-  gitrevue -                       # read stdin explicitly
-  gitrevue -p patch.diff           # read from a patch file
+  gitr                         # git diff (unstaged changes)
+  gitr master                  # git diff master (to working tree)
+  gitr --merge-base master     # diff from common ancestor to working tree
+  gitr master HEAD             # git diff master HEAD (committed only)
+  git diff | gitr              # pipe a patch
+  gitr -                       # read stdin explicitly
+  gitr -p patch.diff           # read from a patch file
 
-  GITREVUE_SCALE=2 gitrevue master   # scale UI up (HiDPI)
+  GITR_SCALE=2 gitr master   # scale UI up (HiDPI)
 """
 
 
@@ -94,9 +94,9 @@ class GitSource:
             return subprocess.check_output(
                 ['git', 'diff'] + self._refs, text=True, stderr=subprocess.PIPE)
         except subprocess.CalledProcessError as e:
-            sys.exit(f'gitrevue: git command failed: {e.stderr.strip()}')
+            sys.exit(f'gitr: git command failed: {e.stderr.strip()}')
         except FileNotFoundError:
-            sys.exit('gitrevue: git not found in PATH')
+            sys.exit('gitr: git not found in PATH')
 
     def label(self) -> str:
         if self._merge_base:
@@ -1012,7 +1012,7 @@ class App:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog='gitrevue', description=USAGE,
+    parser = argparse.ArgumentParser(prog='gitr', description=USAGE,
                                      formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('--merge-base', action='store_true', dest='merge_base')
     parser.add_argument('-p', '--patch', metavar='FILE', default=None)
@@ -1020,7 +1020,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.merge_base and not args.refs:
-        sys.exit('gitrevue: --merge-base requires a ref (e.g. gitrevue --merge-base master)')
+        sys.exit('gitr: --merge-base requires a ref (e.g. gitr --merge-base master)')
 
     source: PatchSource | GitSource
 
@@ -1028,7 +1028,7 @@ def main() -> None:
         try:
             text = sys.stdin.read() if args.patch == '-' else Path(args.patch).read_text()
         except OSError as e:
-            sys.exit(f'gitrevue: {e}')
+            sys.exit(f'gitr: {e}')
         label = '' if args.patch == '-' else args.patch
         source = PatchSource(text, label=label)
     elif args.refs == ['-']:
@@ -1042,7 +1042,7 @@ def main() -> None:
 
     diff_text = source.diff_text()
     if not diff_text.strip():
-        print('gitrevue: no changes')
+        print('gitr: no changes')
         sys.exit(0)
 
     root = tk.Tk()
@@ -1051,7 +1051,7 @@ def main() -> None:
         cwd_label = '~/' + cwd.relative_to(Path.home()).as_posix()
     except ValueError:
         cwd_label = cwd.as_posix()
-    title_parts = ['gitrevue', cwd_label]
+    title_parts = ['gitr', cwd_label]
     src_label = source.label()
     if src_label:
         title_parts.append(src_label)

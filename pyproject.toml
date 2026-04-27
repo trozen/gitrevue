@@ -3,13 +3,13 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gitrevue"
+name = "gitr"
 version = "0.1.0.dev0"
 description = "Lightweight Git diff viewer"
 requires-python = ">=3.10"
 
 [project.scripts]
-gitrevue = "gitrevue:main"
+gitr = "gitr:main"
 
 [tool.setuptools]
-py-modules = ["gitrevue"]
+py-modules = ["gitr"]
