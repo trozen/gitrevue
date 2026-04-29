@@ -253,6 +253,7 @@ class CFG:
     diff_hi_blend      = 0.12   # bg intensity for changed lines / word-diff changed words
     diff_dim_blend     = 0.06   # bg intensity for word-diff unchanged words
     diff_dim_fg        = 0.50   # fg intensity for word-diff unchanged words
+    word_diff_min_ratio = 0.35  # below this similarity, fall back to plain line diff
 
 
 # --colour scheme (dracula) --------------------------------------------------
@@ -353,6 +354,69 @@ def _primary_monitor_size() -> tuple[int, int]:
 _MM_LINE_H = 2  # natural minimap pixels per source line (matches VS Code behaviour)
 
 
+def _pair_lines_for_word_diff(
+    rem_lines: list[str], add_lines: list[str]
+) -> list[tuple]:
+    """Order-preserving optimal matching between removed and added lines.
+
+    Returns a list of ('pair', old, new), ('rem', old), or ('add', new).
+    Uses DP to maximise total similarity, so a re-indented block mixed with
+    inserted/deleted lines gets correctly paired rather than sequentially
+    mis-matched.  Lines with similarity below CFG.word_diff_min_ratio are
+    left unpaired and rendered as plain removed/added.
+    """
+    m, n = len(rem_lines), len(add_lines)
+
+    def nws_tokens(text: str) -> list[str]:
+        return [t for t in re.findall(r'\w+|[^\w\s]|\s+', text) if not t.isspace()]
+
+    tok_rem = [nws_tokens(line) for line in rem_lines]
+    tok_add = [nws_tokens(line) for line in add_lines]
+
+    def sim(i: int, j: int) -> float:
+        return difflib.SequenceMatcher(None, tok_rem[i], tok_add[j], autojunk=False).ratio()
+
+    sims = [[sim(i, j) for j in range(n)] for i in range(m)]
+
+    # dp[i][j] = best total similarity pairing rem[0..i-1] with add[0..j-1]
+    dp     = [[0.0] * (n + 1) for _ in range(m + 1)]
+    choice = [['']  * (n + 1) for _ in range(m + 1)]
+
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            best, ch = dp[i - 1][j], 'rem'
+            if dp[i][j - 1] >= best:          # prefer 'add' on tie → removes-before-adds when unpaired
+                best, ch = dp[i][j - 1], 'add'
+            if sims[i - 1][j - 1] >= CFG.word_diff_min_ratio:
+                v = dp[i - 1][j - 1] + sims[i - 1][j - 1]
+                if v > best:
+                    best, ch = v, 'pair'
+            dp[i][j] = best
+            choice[i][j] = ch
+
+    result: list[tuple] = []
+    i, j = m, n
+    while i > 0 or j > 0:
+        if i == 0:
+            result.append(('add', add_lines[j - 1]))
+            j -= 1
+        elif j == 0:
+            result.append(('rem', rem_lines[i - 1]))
+            i -= 1
+        elif choice[i][j] == 'pair':
+            result.append(('pair', rem_lines[i - 1], add_lines[j - 1]))
+            i -= 1
+            j -= 1
+        elif choice[i][j] == 'rem':
+            result.append(('rem', rem_lines[i - 1]))
+            i -= 1
+        else:
+            result.append(('add', add_lines[j - 1]))
+            j -= 1
+    result.reverse()
+    return result
+
+
 class App:
     def __init__(self, root: tk.Tk, diff_text: str) -> None:
         self.root = root
@@ -374,7 +438,7 @@ class App:
         cfg = self._load_config()
         self._wrap_var = tk.BooleanVar(value=cfg.get('wrap_lines', True))
         self._tree_var = tk.BooleanVar(value=cfg.get('tree_view', False))
-        self._word_diff_var = tk.BooleanVar(value=cfg.get('word_diff', False))
+        self._word_diff_var = tk.BooleanVar(value=cfg.get('word_diff', True))
         self._scale = _detect_scale(root)
 
         self._build_ui()
@@ -852,8 +916,16 @@ class App:
         Changed words: white text on saturated background (clearly different).
         Text colour is always white so nothing becomes illegible.
         """
-        tok_old = re.findall(r'\S+|\s+', old_text) or ['']
-        tok_new = re.findall(r'\S+|\s+', new_text) or ['']
+        tok_old = re.findall(r'\w+|[^\w\s]|\s+', old_text) or ['']
+        tok_new = re.findall(r'\w+|[^\w\s]|\s+', new_text) or ['']
+        nws_old = [t for t in tok_old if not t.isspace()]
+        nws_new = [t for t in tok_new if not t.isspace()]
+        if difflib.SequenceMatcher(None, nws_old, nws_new, autojunk=False).ratio() < CFG.word_diff_min_ratio:
+            self._diff.insert('end', f'-{old_text}\n', 'removed')
+            self._minimap_lines.append(('removed', '-' + old_text))
+            self._diff.insert('end', f'+{new_text}\n', 'added')
+            self._minimap_lines.append(('added', '+' + new_text))
+            return
         opcodes = difflib.SequenceMatcher(None, tok_old, tok_new, autojunk=False).get_opcodes()
 
         self._diff.insert('end', '-', 'removed')
@@ -878,16 +950,16 @@ class App:
         pending_add: list[str] = []
 
         def flush():
-            if word_diff:
-                n = min(len(pending_rem), len(pending_add))
-                for old, new in zip(pending_rem[:n], pending_add[:n]):
-                    self._insert_word_diff(old, new)
-                for old in pending_rem[n:]:
-                    self._diff.insert('end', f'-{old}\n', 'removed')
-                    self._minimap_lines.append(('removed', f'-{old}'))
-                for new in pending_add[n:]:
-                    self._diff.insert('end', f'+{new}\n', 'added')
-                    self._minimap_lines.append(('added', f'+{new}'))
+            if word_diff and pending_rem and pending_add:
+                for action in _pair_lines_for_word_diff(pending_rem, pending_add):
+                    if action[0] == 'pair':
+                        self._insert_word_diff(action[1], action[2])
+                    elif action[0] == 'rem':
+                        self._diff.insert('end', f'-{action[1]}\n', 'removed')
+                        self._minimap_lines.append(('removed', f'-{action[1]}'))
+                    else:
+                        self._diff.insert('end', f'+{action[1]}\n', 'added')
+                        self._minimap_lines.append(('added', f'+{action[1]}'))
             else:
                 for old in pending_rem:
                     self._diff.insert('end', f'-{old}\n', 'removed')
