@@ -304,12 +304,13 @@ def _mix(c1: str, c2: str, t: float) -> str:
 
 # non-whitespace pixel colours in the minimap; None = leave as canvas bg
 _MINIMAP_COLORS: dict[str, str | None] = {
-    'added':   _blend(C['added_fg'],      0.45),
-    'removed': _blend(C['removed_fg'],    0.45),
-    'hunk':    _blend(C['hunk_fg'],       0.35),
-    'filehdr': _blend(C['fileheader_fg'], 0.35),
-    'fileidx': _blend(C['fileheader_fg'], 0.35),
-    'context': _blend(C['fg'], 0.18),
+    'added':    _blend(C['added_fg'],      0.45),
+    'removed':  _blend(C['removed_fg'],    0.45),
+    'hunk':     _blend(C['hunk_fg'],       0.35),
+    'filehdr':  _blend(C['fileheader_fg'], 0.35),
+    'fileidx':  _blend(C['fileheader_fg'], 0.35),
+    'context':  _blend(C['fg'], 0.18),
+    'reindent': _blend(C['fg'], 0.18),
 }
 
 
@@ -438,7 +439,8 @@ class App:
         cfg = self._load_config()
         self._wrap_var = tk.BooleanVar(value=cfg.get('wrap_lines', True))
         self._tree_var = tk.BooleanVar(value=cfg.get('tree_view', False))
-        self._word_diff_var = tk.BooleanVar(value=cfg.get('word_diff', True))
+        _wd_default = 2 if cfg.get('word_diff', True) else 0  # migrate old bool config
+        self._word_diff_var = tk.IntVar(value=cfg.get('word_diff_mode', _wd_default))
         self._scale = _detect_scale(root)
 
         self._build_ui()
@@ -479,9 +481,17 @@ class App:
                                   command=self._on_wrap_toggle)
         view_menu.add_checkbutton(label='Tree view', variable=self._tree_var,
                                   command=self._on_tree_toggle)
-        view_menu.add_checkbutton(label='Word diff', accelerator='d',
-                                  variable=self._word_diff_var,
-                                  command=self._on_word_diff_toggle)
+        word_diff_menu = tk.Menu(view_menu, tearoff=0, **menu_kw)
+        word_diff_menu.add_radiobutton(label='Off',                      value=0,
+                                       variable=self._word_diff_var,
+                                       command=self._on_word_diff_toggle)
+        word_diff_menu.add_radiobutton(label='On',                       value=1,
+                                       variable=self._word_diff_var,
+                                       command=self._on_word_diff_toggle)
+        word_diff_menu.add_radiobutton(label='On + collapse re-indented', value=2,
+                                       variable=self._word_diff_var,
+                                       command=self._on_word_diff_toggle)
+        view_menu.add_cascade(label='Word diff', menu=word_diff_menu, accelerator='d')
         menubar.add_cascade(label='View', menu=view_menu)
         go_menu = tk.Menu(menubar, tearoff=0, **menu_kw)
         go_menu.add_command(label='Next file',     accelerator='n / Tab',
@@ -505,6 +515,7 @@ class App:
         self._lbl_stat = tk.Label(bar, bg=C['topbar_bg'], fg=C['subdued'], font=font)
         self._lbl_stat.pack(side='left')
 
+
         # two-panel split
         self._sash = tk.PanedWindow(self.root, orient='horizontal',
                                      bg=C['subdued'], sashwidth=3, sashrelief='flat')
@@ -512,12 +523,41 @@ class App:
 
         # left: diff (grid so the scrollbar corner square fits neatly)
         lf = tk.Frame(self._sash, bg=C['bg'])
-        lf.grid_rowconfigure(1, weight=1)
+        lf.grid_rowconfigure(2, weight=1)
         lf.grid_columnconfigure(0, weight=1)
+
+        bar_font = (CFG.font_family, int(CFG.menu_font_size * self._scale))
+        diff_bar = tk.Frame(lf, bg=C['topbar_bg'])
+        diff_bar.grid(row=0, column=0, columnspan=3, sticky='ew')
+        menu_kw_bar = dict(bg=C['topbar_bg'], fg=C['fg'],
+                           activebackground=C['selected_bg'], activeforeground=C['fg'],
+                           relief='flat', bd=0, font=bar_font, tearoff=0)
+        self._wd_btn = tk.Menubutton(diff_bar, bg=C['topbar_bg'], fg=C['fg'],
+                                      activebackground=C['selected_bg'], activeforeground=C['fg'],
+                                      relief='groove', bd=1, highlightthickness=0,
+                                      font=bar_font, padx=8, pady=2)
+        wd_menu = tk.Menu(self._wd_btn, **menu_kw_bar)
+        self._wd_btn['menu'] = wd_menu
+        for i, name in enumerate(('plain', 'word', 'word+~')):
+            wd_menu.add_command(label=name, command=lambda v=i: self._set_word_diff_mode(v))
+        self._wd_btn.pack(side='left')
+        self._update_wd_bar()
+
+        self._wrap_btn = tk.Menubutton(diff_bar, bg=C['topbar_bg'], fg=C['fg'],
+                                        activebackground=C['selected_bg'], activeforeground=C['fg'],
+                                        relief='groove', bd=1, highlightthickness=0,
+                                        font=bar_font, padx=8, pady=2)
+        wrap_menu = tk.Menu(self._wrap_btn, **menu_kw_bar)
+        self._wrap_btn['menu'] = wrap_menu
+        for name in ('wrap', 'no wrap'):
+            wrap_menu.add_command(label=name,
+                                  command=lambda v=(name == 'wrap'): self._set_wrap_mode(v))
+        self._wrap_btn.pack(side='left', padx=(4, 0))
+        self._update_wrap_bar()
 
         self._sticky = tk.Label(lf, bg=C['topbar_bg'], fg=C['fg'],
                                  font=font, anchor='w', padx=10, pady=3, text='')
-        self._sticky.grid(row=0, column=0, columnspan=3, sticky='ew')
+        self._sticky.grid(row=1, column=0, columnspan=3, sticky='ew')
 
         self._diff = tk.Text(lf, bg=C['bg'], fg=C['fg'],
                               font=font, wrap='char',
@@ -540,6 +580,9 @@ class App:
         self._diff.bind('n',              lambda e: self._jump_to_adjacent_file( 1) or 'break')
         self._diff.bind('p',              lambda e: self._jump_to_adjacent_file(-1) or 'break')
         self._diff.bind('d',              lambda e: self._toggle_word_diff() or 'break')
+        self._diff.bind('t',              lambda e: self._toggle_tree() or 'break')
+        self._diff.bind('w',              lambda e: self._toggle_wrap() or 'break')
+        self._diff.bind('c',              lambda e: self._copy_loc_and_lines() or 'break')
         self._diff.bind('<Tab>',          lambda e: self._jump_to_adjacent_file( 1) or 'break')
         self._diff.bind('<Shift-Tab>',      lambda e: self._jump_to_adjacent_file(-1) or 'break')
         self._diff.bind('<ISO_Left_Tab>',   lambda e: self._jump_to_adjacent_file(-1) or 'break')
@@ -548,20 +591,20 @@ class App:
         self._diff_vs.bind('<ButtonPress-1>', lambda e: setattr(self, '_manual_scroll', True))
         hs = self._make_scrollbar(lf, orient='horizontal', command=self._diff.xview)
         self._diff.configure(yscrollcommand=self._on_diff_yscroll, xscrollcommand=hs.set)
-        self._diff.grid(row=1, column=0, sticky='nsew')
+        self._diff.grid(row=2, column=0, sticky='nsew')
 
         self._minimap = tk.Canvas(lf, width=int(CFG.minimap_w * self._scale),
                                   bg=C['bg'], highlightthickness=0)
-        self._minimap.grid(row=1, column=1, rowspan=2, sticky='ns')
+        self._minimap.grid(row=2, column=1, rowspan=2, sticky='ns')
         self._minimap.bind('<Configure>',  lambda e: self._render_minimap())
         self._minimap.bind('<Button-1>',   self._on_minimap_click)
         self._minimap.bind('<B1-Motion>',  self._on_minimap_click)
 
-        self._diff_vs.grid(row=1, column=2, sticky='ns')
-        hs.grid(row=2, column=0, sticky='ew')
+        self._diff_vs.grid(row=2, column=2, sticky='ns')
+        hs.grid(row=3, column=0, sticky='ew')
         _sw = int(CFG.scrollbar_w * self._scale)
         corner = tk.Frame(lf, bg=C['topbar_bg'], width=_sw, height=_sw)
-        corner.grid(row=2, column=2)
+        corner.grid(row=3, column=2)
         self._diff_hs = hs
         self._diff_hs_corner = corner
         # wrap on by default — horizontal scrollbar not needed
@@ -570,6 +613,19 @@ class App:
 
         # right: file list
         rf = tk.Frame(self._sash, bg=C['bg'])
+        flist_bar = tk.Frame(rf, bg=C['topbar_bg'])
+        flist_bar.pack(fill='x')
+        self._flist_btn = tk.Menubutton(flist_bar, bg=C['topbar_bg'], fg=C['fg'],
+                                         activebackground=C['selected_bg'], activeforeground=C['fg'],
+                                         relief='groove', bd=1, highlightthickness=0,
+                                         font=bar_font, padx=8, pady=2)
+        flist_menu = tk.Menu(self._flist_btn, **menu_kw_bar)
+        self._flist_btn['menu'] = flist_menu
+        for name in ('list', 'tree'):
+            flist_menu.add_command(label=name,
+                                   command=lambda v=(name == 'tree'): self._set_tree_mode(v))
+        self._flist_btn.pack(side='left')
+        self._update_flist_bar()
         self._flist = tk.Text(rf, bg=C['bg'], fg=C['fg'],
                                font=font, wrap='none',
                                relief='flat', bd=0, state='disabled', cursor='arrow',
@@ -612,6 +668,7 @@ class App:
         # Word diff: unchanged words — colored text, barely-there bg so they recede
         self._diff.tag_configure('removed_word', foreground=_blend(C['removed_fg'], CFG.diff_dim_fg), background=_blend(C['removed_fg'], CFG.diff_dim_blend))
         self._diff.tag_configure('added_word',   foreground=_blend(C['added_fg'],   CFG.diff_dim_fg), background=_blend(C['added_fg'],   CFG.diff_dim_blend))
+        self._diff.tag_configure('reindent',     foreground=C['subdued'])
         # Word diff: changed words — same "change highlight" bg as the full-line removed/added tags
         self._diff.tag_configure('removed_hi',   foreground=C['removed_fg'], background=_rem_hi)
         self._diff.tag_configure('added_hi',     foreground=C['added_fg'],   background=_add_hi)
@@ -628,6 +685,21 @@ class App:
         self._flist.bind('<Down>',       lambda e: self._flist_nav( 1) or 'break')
         self._flist.bind('<Return>',     lambda e: self._flist_activate() or 'break')
         self._flist.bind('d',            lambda e: self._toggle_word_diff() or 'break')
+        self._flist.bind('t',            lambda e: self._toggle_tree() or 'break')
+        self._flist.bind('w',            lambda e: self._toggle_wrap() or 'break')
+        self._flist.bind('c',            lambda e: self._copy_loc_and_lines() or 'break')
+        self._on_wrap_toggle()
+
+    def _update_wrap_bar(self) -> None:
+        name = 'wrap' if self._wrap_var.get() else 'no wrap'
+        self._wrap_btn.configure(text=f'Wrap (w): {name}')
+
+    def _set_wrap_mode(self, wrap: bool) -> None:
+        self._wrap_var.set(wrap)
+        self._on_wrap_toggle()
+
+    def _toggle_wrap(self) -> None:
+        self._wrap_var.set(not self._wrap_var.get())
         self._on_wrap_toggle()
 
     def _on_wrap_toggle(self) -> None:
@@ -640,18 +712,41 @@ class App:
             self._diff.configure(wrap='none')
             self._diff_hs.grid()
             self._diff_hs_corner.grid()
+        self._update_wrap_bar()
         self._save_config({'wrap_lines': wrap})
 
+    def _update_flist_bar(self) -> None:
+        name = 'tree' if self._tree_var.get() else 'list'
+        self._flist_btn.configure(text=f'Files (t): {name}')
+
+    def _set_tree_mode(self, tree: bool) -> None:
+        self._tree_var.set(tree)
+        self._on_tree_toggle()
+
+    def _toggle_tree(self) -> None:
+        self._tree_var.set(not self._tree_var.get())
+        self._on_tree_toggle()
+
     def _on_tree_toggle(self) -> None:
+        self._update_flist_bar()
         self._save_config({'tree_view': self._tree_var.get()})
         self._render_flist(self._entries)
 
+    def _update_wd_bar(self) -> None:
+        name = ('plain', 'word', 'word+~')[self._word_diff_var.get()]
+        self._wd_btn.configure(text=f'Diff (d): {name}')
+
+    def _set_word_diff_mode(self, mode: int) -> None:
+        self._word_diff_var.set(mode)
+        self._on_word_diff_toggle()
+
     def _toggle_word_diff(self) -> None:
-        self._word_diff_var.set(not self._word_diff_var.get())
+        self._word_diff_var.set((self._word_diff_var.get() + 1) % 3)
         self._on_word_diff_toggle()
 
     def _on_word_diff_toggle(self) -> None:
-        self._save_config({'word_diff': self._word_diff_var.get()})
+        self._update_wd_bar()
+        self._save_config({'word_diff_mode': self._word_diff_var.get()})
         top_line = int(self._diff.index('@0,0').split('.')[0])
         self._render_diff_panel()
         self._diff.yview(f'{top_line}.0')
@@ -926,6 +1021,10 @@ class App:
             self._diff.insert('end', f'+{new_text}\n', 'added')
             self._minimap_lines.append(('added', '+' + new_text))
             return
+        if nws_old == nws_new and self._word_diff_var.get() == 2:
+            self._diff.insert('end', f'~{new_text}\n', 'reindent')
+            self._minimap_lines.append(('reindent', new_text))
+            return
         opcodes = difflib.SequenceMatcher(None, tok_old, tok_new, autojunk=False).get_opcodes()
 
         self._diff.insert('end', '-', 'removed')
@@ -1149,6 +1248,30 @@ class App:
 
         return path, new_line
 
+    def _copy_loc_and_lines(self, anchor_line: int | None = None) -> None:
+        try:
+            sel_first = self._diff.index('sel.first')
+            sel_last  = self._diff.index('sel.last')
+        except tk.TclError:
+            sel_first = sel_last = None
+
+        if sel_first is not None:
+            lines_start = int(sel_first.split('.')[0])
+            lines_end   = int(sel_last.split('.')[0])
+            if sel_last.split('.')[1] == '0' and lines_end > lines_start:
+                lines_end -= 1
+        else:
+            line = anchor_line or int(self._diff.index('insert').split('.')[0])
+            lines_start = lines_end = line
+
+        path, line_no = self._source_location(lines_start)
+        if not path:
+            return
+        loc = f'{path}:{line_no}' if line_no is not None else path
+        text = self._diff.get(f'{lines_start}.0', f'{lines_end}.end')
+        self.root.clipboard_clear()
+        self.root.clipboard_append(f'{loc}\n{text}')
+
     def _show_diff_context_menu(self, event: tk.Event) -> None:
         text_line = int(self._diff.index(f'@{event.x},{event.y}').split('.')[0])
         path, line_no = self._source_location(text_line)
@@ -1174,7 +1297,6 @@ class App:
         if sel_first is not None:
             lines_start = int(sel_first.split('.')[0])
             lines_end   = int(sel_last.split('.')[0])
-            # If selection ends at column 0, that line isn't visually included
             if sel_last.split('.')[1] == '0' and lines_end > lines_start:
                 lines_end -= 1
             lines_path, lines_line_no = self._source_location(lines_start)
@@ -1187,8 +1309,8 @@ class App:
         lines_text = self._diff.get(f'{lines_start}.0', f'{lines_end}.end')
         menu.add_command(
             label=f'Copy "{lines_loc}" + {n_lines} {"line" if n_lines == 1 else "lines"}',
-            command=lambda t=f'{lines_loc}\n{lines_text}': (
-                self.root.clipboard_clear(), self.root.clipboard_append(t)))
+            accelerator='c',
+            command=lambda: self._copy_loc_and_lines(text_line))
 
         menu.tk_popup(event.x_root, event.y_root)
 
