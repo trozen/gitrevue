@@ -233,8 +233,8 @@ class CFG:
     font_size          = 12
     window_scale       = 0.75    # fraction of screen size on startup
     sash_ratio         = 0.70
-    scrollbar_w        = 28
-    minimap_w          = 120
+    scrollbar_w        = 16
+    minimap_w          = 160
     scroll_speed       = 8   # lines per mouse-wheel tick
     diff_hi_blend      = 0.12   # bg intensity for changed lines / word-diff changed words
     diff_dim_blend     = 0.06   # bg intensity for word-diff unchanged words
@@ -300,6 +300,22 @@ _MINIMAP_COLORS: dict[str, str | None] = {
 
 # --application ------------------------------------------------------------
 
+def _detect_scale(root: tk.Tk) -> float:
+    """Return UI scale factor: 1.0 = 96 DPI (standard), 2.0 = HiDPI, etc.
+
+    GITR_SCALE env var overrides auto-detection.
+    """
+    env = os.environ.get('GITR_SCALE')
+    if env:
+        try:
+            return max(0.25, float(env))
+        except ValueError:
+            pass
+    # winfo_fpixels('1i') = pixels per inch; 96 is the baseline for scale=1.
+    dpi = root.winfo_fpixels('1i')
+    return dpi / 96.0
+
+
 def _primary_monitor_size() -> tuple[int, int]:
     try:
         out = subprocess.run(['xrandr', '--query'], capture_output=True, text=True,
@@ -345,6 +361,7 @@ class App:
         self._wrap_var = tk.BooleanVar(value=cfg.get('wrap_lines', True))
         self._tree_var = tk.BooleanVar(value=cfg.get('tree_view', False))
         self._word_diff_var = tk.BooleanVar(value=cfg.get('word_diff', False))
+        self._scale = _detect_scale(root)
 
         self._build_ui()
         self._load()
@@ -366,7 +383,7 @@ class App:
                             troughcolor=C['bg'],
                             activebackground=C['subdued'],
                             relief='flat', bd=0,
-                            width=CFG.scrollbar_w,
+                            width=int(CFG.scrollbar_w * self._scale),
                             **kw)
 
     def _build_ui(self) -> None:
@@ -451,8 +468,8 @@ class App:
         self._diff.configure(yscrollcommand=self._on_diff_yscroll, xscrollcommand=hs.set)
         self._diff.grid(row=1, column=0, sticky='nsew')
 
-        self._minimap = tk.Canvas(lf, width=CFG.minimap_w, bg=C['bg'],
-                                   highlightthickness=0)
+        self._minimap = tk.Canvas(lf, width=int(CFG.minimap_w * self._scale),
+                                  bg=C['bg'], highlightthickness=0)
         self._minimap.grid(row=1, column=1, rowspan=2, sticky='ns')
         self._minimap.bind('<Configure>',  lambda e: self._render_minimap())
         self._minimap.bind('<Button-1>',   self._on_minimap_click)
@@ -460,7 +477,8 @@ class App:
 
         self._diff_vs.grid(row=1, column=2, sticky='ns')
         hs.grid(row=2, column=0, sticky='ew')
-        corner = tk.Frame(lf, bg=C['topbar_bg'], width=CFG.scrollbar_w, height=CFG.scrollbar_w)
+        _sw = int(CFG.scrollbar_w * self._scale)
+        corner = tk.Frame(lf, bg=C['topbar_bg'], width=_sw, height=_sw)
         corner.grid(row=2, column=2)
         self._diff_hs = hs
         self._diff_hs_corner = corner
