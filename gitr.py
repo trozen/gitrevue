@@ -231,6 +231,7 @@ def _walk_trie(node: dict, rows: list, depth: int, dir_label: str) -> None:
 class CFG:
     font_family        = 'monospace'
     font_size          = 12
+    menu_font_size     = 8
     window_scale       = 0.75    # fraction of screen size on startup
     sash_ratio         = 0.70
     scrollbar_w        = 16
@@ -387,9 +388,10 @@ class App:
                             **kw)
 
     def _build_ui(self) -> None:
+        menu_font = (CFG.font_family, int(CFG.menu_font_size * self._scale))
         menu_kw = dict(bg=C['topbar_bg'], fg=C['fg'],
                        activebackground=C['selected_bg'], activeforeground=C['fg'],
-                       relief='flat', bd=0)
+                       relief='flat', bd=0, font=menu_font)
         menubar = tk.Menu(self.root, **menu_kw)
         file_menu = tk.Menu(menubar, tearoff=0, **menu_kw)
         file_menu.add_command(label='Quit', accelerator='Ctrl+Q',
@@ -462,6 +464,7 @@ class App:
         self._diff.bind('<Tab>',          lambda e: self._jump_to_adjacent_file( 1) or 'break')
         self._diff.bind('<Shift-Tab>',      lambda e: self._jump_to_adjacent_file(-1) or 'break')
         self._diff.bind('<ISO_Left_Tab>',   lambda e: self._jump_to_adjacent_file(-1) or 'break')
+        self._diff.bind('<ButtonRelease-3>', self._show_diff_context_menu)
         self._diff_vs = self._make_scrollbar(lf, orient='vertical', command=self._diff.yview)
         self._diff_vs.bind('<ButtonPress-1>', lambda e: setattr(self, '_manual_scroll', True))
         hs = self._make_scrollbar(lf, orient='horizontal', command=self._diff.xview)
@@ -1014,6 +1017,85 @@ class App:
             self._highlight_row(display_row)
         self._jump_to(target_entry.path)
         self._diff.focus_set()
+
+    def _source_location(self, text_line: int) -> tuple[str, int | None]:
+        """Return (file_path, new-file line number) for a diff text widget line."""
+        if not self._pos_order:
+            return '', None
+
+        path = self._pos_order[0][1]
+        for ln, p in self._pos_order:
+            if ln <= text_line:
+                path = p
+            else:
+                break
+
+        # Scan backwards for the nearest @@ hunk header.
+        hunk_line = None
+        new_start = None
+        for ln in range(text_line, 0, -1):
+            content = self._diff.get(f'{ln}.0', f'{ln}.end')
+            if content.startswith('@@ '):
+                m = re.search(r'\+(\d+)', content)
+                if m:
+                    new_start = int(m.group(1))
+                    hunk_line = ln
+                break
+
+        if hunk_line is None or new_start is None:
+            return path, None
+
+        # Walk from the hunk header to the clicked line tracking new-file line number.
+        # Removed lines (-) don't exist in the new file, so only context and added lines advance.
+        new_line = new_start - 1
+        for ln in range(hunk_line + 1, text_line + 1):
+            if not self._diff.get(f'{ln}.0', f'{ln}.1').startswith('-'):
+                new_line += 1
+
+        return path, new_line
+
+    def _show_diff_context_menu(self, event: tk.Event) -> None:
+        text_line = int(self._diff.index(f'@{event.x},{event.y}').split('.')[0])
+        path, line_no = self._source_location(text_line)
+        if not path:
+            return
+
+        loc = f'{path}:{line_no}' if line_no is not None else path
+        menu_kw = dict(bg=C['topbar_bg'], fg=C['fg'],
+                       activebackground=C['selected_bg'], activeforeground=C['fg'],
+                       relief='flat', bd=0, tearoff=0,
+                       font=(CFG.font_family, int(CFG.menu_font_size * self._scale)))
+        menu = tk.Menu(self.root, **menu_kw)
+        menu.add_command(label=f'Copy "{loc}"',
+                         command=lambda: (self.root.clipboard_clear(),
+                                          self.root.clipboard_append(loc)))
+
+        try:
+            sel_first = self._diff.index('sel.first')
+            sel_last  = self._diff.index('sel.last')
+        except tk.TclError:
+            sel_first = sel_last = None
+
+        if sel_first is not None:
+            lines_start = int(sel_first.split('.')[0])
+            lines_end   = int(sel_last.split('.')[0])
+            # If selection ends at column 0, that line isn't visually included
+            if sel_last.split('.')[1] == '0' and lines_end > lines_start:
+                lines_end -= 1
+            lines_path, lines_line_no = self._source_location(lines_start)
+            lines_loc = f'{lines_path}:{lines_line_no}' if lines_line_no is not None else lines_path
+        else:
+            lines_start = lines_end = text_line
+            lines_loc = loc
+
+        n_lines = lines_end - lines_start + 1
+        lines_text = self._diff.get(f'{lines_start}.0', f'{lines_end}.end')
+        menu.add_command(
+            label=f'Copy "{lines_loc}" + {n_lines} {"line" if n_lines == 1 else "lines"}',
+            command=lambda t=f'{lines_loc}\n{lines_text}': (
+                self.root.clipboard_clear(), self.root.clipboard_append(t)))
+
+        menu.tk_popup(event.x_root, event.y_root)
 
     def _jump_to(self, path: str) -> None:
         self._manual_scroll = False
