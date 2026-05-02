@@ -105,6 +105,62 @@ class GitSource:
 
 
 
+def _find_gitr_dir() -> 'Path | None':
+    for d in [Path.cwd(), *Path.cwd().parents]:
+        if (d / '.git').is_dir() or (d / '.git').is_file():
+            return d / '.gitr'
+    return None
+
+
+class ReviewStore:
+    def __init__(self) -> None:
+        gitr_dir = _find_gitr_dir()
+        self._path = (gitr_dir / 'review.json') if gitr_dir else None
+        self._data: dict[str, dict[str, str]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if self._path and self._path.exists():
+            try:
+                for entry in json.loads(self._path.read_text()):
+                    self._data.setdefault(entry['file'], {})[entry['line']] = entry['comment']
+            except (OSError, json.JSONDecodeError, KeyError, TypeError):
+                pass
+
+    def _save(self) -> None:
+        if not self._path:
+            return
+        entries = [{'file': f, 'line': l, 'comment': c}
+                   for f, lines in self._data.items() for l, c in lines.items()]
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(json.dumps(entries, indent=2))
+        except OSError:
+            pass
+
+    def get(self, file: str, line_text: str) -> str | None:
+        return self._data.get(file, {}).get(line_text)
+
+    def set(self, file: str, line_text: str, comment: str) -> None:
+        self._data.setdefault(file, {})[line_text] = comment
+        self._save()
+
+    def delete(self, file: str, line_text: str) -> None:
+        if file in self._data and line_text in self._data[file]:
+            del self._data[file][line_text]
+            if not self._data[file]:
+                del self._data[file]
+            self._save()
+
+    def all_comments(self) -> list[tuple[str, str, str]]:
+        return [(f, l, c)
+                for f in sorted(self._data)
+                for l, c in self._data[f].items()]
+
+    def is_empty(self) -> bool:
+        return not any(self._data.values())
+
+
 # --diff parsing ------------------------------------------------------------
 
 _FILEHEADER_PREFIXES = (
@@ -254,6 +310,9 @@ class CFG:
     diff_dim_blend     = 0.06   # bg intensity for word-diff unchanged words
     diff_dim_fg        = 0.50   # fg intensity for word-diff unchanged words
     word_diff_min_ratio = 0.35  # below this similarity, fall back to plain line diff
+    hover_hide_delay_ms     = 150
+    hover_btn_leave_delay_ms = 80
+    edit_focus_out_delay_ms = 50
 
 
 # --colour scheme (dracula) --------------------------------------------------
@@ -274,6 +333,7 @@ C = {
     'status_M':      '#bd93f9',
     'status_D':      '#ff5555',
     'status_R':      '#ff79c6',
+    'comment_fg':    '#f1fa8c',
 }
 
 
@@ -311,6 +371,7 @@ _MINIMAP_COLORS: dict[str, str | None] = {
     'fileidx':  _blend(C['fileheader_fg'], 0.35),
     'context':  _blend(C['fg'], 0.18),
     'reindent': _blend(C['fg'], 0.18),
+    'comment':  _blend(C['comment_fg'], 0.80),
 }
 
 
@@ -430,12 +491,22 @@ class App:
         self._scroll_pos: tuple[float, float] = (0.0, 1.0)
         self._minimap_content_h: int = 0
         self._hunk_seps: list[tk.Canvas] = []
+        self._comment_frames: list[tk.Frame] = []
         self._scroll_target: float = 0.0
         self._scroll_animating: bool = False
         self._flist_selected_row: int = -1
         self._flist_row_to_entry: list[FileEntry | None] = []
         self._flist_path_to_row: dict[str, int] = {}
         self._manual_scroll: bool = False
+        self._review = ReviewStore()
+        self._active_comment_frame: tk.Frame | None = None
+        self._active_comment_entry: tk.Entry | None = None
+        self._comment_target: tuple[str, str] | None = None
+        self._hover_line: int = -1
+        self._hover_btn_line: int = -1
+        self._hide_after_id: str | None = None
+        self._over_hover_btn: bool = False
+        self._btn_leave_after_id: str | None = None
         cfg = self._load_config()
         self._wrap_var = tk.BooleanVar(value=cfg.get('wrap_lines', True))
         self._tree_var = tk.BooleanVar(value=cfg.get('tree_view', False))
@@ -499,6 +570,9 @@ class App:
         go_menu.add_command(label='Previous file', accelerator='p / Shift+Tab',
                             command=lambda: self._jump_to_adjacent_file(-1))
         menubar.add_cascade(label='Go', menu=go_menu)
+        review_menu = tk.Menu(menubar, tearoff=0, **menu_kw)
+        review_menu.add_command(label='Dump to terminal', command=self._dump_to_terminal)
+        menubar.add_cascade(label='Review', menu=review_menu)
         self.root.configure(bg=C['bg'], menu=menubar)
         sw, sh = _primary_monitor_size()
         w, h = int(sw * CFG.window_scale), int(sh * CFG.window_scale)
@@ -587,6 +661,10 @@ class App:
         self._diff.bind('<Shift-Tab>',      lambda e: self._jump_to_adjacent_file(-1) or 'break')
         self._diff.bind('<ISO_Left_Tab>',   lambda e: self._jump_to_adjacent_file(-1) or 'break')
         self._diff.bind('<ButtonRelease-3>', self._show_diff_context_menu)
+        self._diff.bind('<Motion>', self._on_diff_hover)
+        self._diff.bind('<Leave>',  lambda e: self._schedule_hide())
+        self._comment_hover_btn = self._make_hover_button('+ comment', C['comment_fg'], self._on_comment_btn_click)
+        self._copy_hover_btn    = self._make_hover_button('copy',      C['fg'],          self._on_copy_btn_click)
         self._diff_vs = self._make_scrollbar(lf, orient='vertical', command=self._diff.yview)
         self._diff_vs.bind('<ButtonPress-1>', lambda e: setattr(self, '_manual_scroll', True))
         hs = self._make_scrollbar(lf, orient='horizontal', command=self._diff.xview)
@@ -655,6 +733,7 @@ class App:
         self._diff.tag_configure('status_M',    foreground=C['status_M'])
         self._diff.tag_configure('status_D',    foreground=C['status_D'])
         self._diff.tag_configure('status_R',    foreground=C['status_R'])
+        self._diff.tag_configure('hover',       background=C['topbar_bg'])
 
         # file list tags
         self._flist.tag_configure('status_A',  foreground=C['status_A'])
@@ -669,9 +748,17 @@ class App:
         self._diff.tag_configure('removed_word', foreground=_blend(C['removed_fg'], CFG.diff_dim_fg), background=_blend(C['removed_fg'], CFG.diff_dim_blend))
         self._diff.tag_configure('added_word',   foreground=_blend(C['added_fg'],   CFG.diff_dim_fg), background=_blend(C['added_fg'],   CFG.diff_dim_blend))
         self._diff.tag_configure('reindent',     foreground=C['subdued'])
+        _comment_bg = _blend(C['comment_fg'], 0.55)
+        self._comment_bg = _comment_bg
+        self._diff.tag_configure('comment', foreground=C['bg'], background=_comment_bg,
+                                 spacing1=6, spacing3=6)
+        self._diff.tag_bind('comment', '<Button-1>', self._on_comment_click)
+        self._diff.tag_bind('comment', '<Enter>', lambda e: self._diff.config(cursor='hand2'))
+        self._diff.tag_bind('comment', '<Leave>', lambda e: self._diff.config(cursor=''))
         # Word diff: changed words — same "change highlight" bg as the full-line removed/added tags
         self._diff.tag_configure('removed_hi',   foreground=C['removed_fg'], background=_rem_hi)
         self._diff.tag_configure('added_hi',     foreground=C['added_fg'],   background=_add_hi)
+        self._diff.tag_raise('hover')
         self._diff.tag_raise('sel')
 
         self._flist.bind('<Button-1>', self._on_file_click)
@@ -747,10 +834,7 @@ class App:
     def _on_word_diff_toggle(self) -> None:
         self._update_wd_bar()
         self._save_config({'word_diff_mode': self._word_diff_var.get()})
-        top_line = int(self._diff.index('@0,0').split('.')[0])
-        self._render_diff_panel()
-        self._diff.yview(f'{top_line}.0')
-        self._scroll_target = self._diff.yview()[0]
+        self._rerender_preserving_scroll()
 
     @staticmethod
     def _load_config() -> dict:
@@ -828,16 +912,53 @@ class App:
 
     # --hunk separators -------------------------------------------------------
 
+    def _make_hover_button(self, text: str, fg: str, command) -> tk.Button:
+        btn = tk.Button(
+            self._diff, text=text,
+            bg=C['topbar_bg'], fg=fg,
+            activebackground=C['topbar_bg'], activeforeground=fg,
+            relief='flat', bd=0, highlightthickness=0, cursor='hand2',
+            font=(CFG.font_family, int(CFG.menu_font_size * self._scale)),
+            command=command,
+        )
+        btn.bind('<Enter>', lambda e: self._on_btn_enter())
+        btn.bind('<Leave>', lambda e: self._on_btn_leave())
+        return btn
+
+    def _diff_row_pad(self) -> int:
+        cached = getattr(self, '_diff_row_pad_cached', None)
+        if cached is not None:
+            return cached
+        try:
+            padx = int(str(self._diff.cget('padx')))
+            hl   = int(str(self._diff.cget('highlightthickness')))
+        except (tk.TclError, ValueError):
+            padx, hl = 1, 1
+        self._diff_row_pad_cached = 2 * (padx + hl)
+        return self._diff_row_pad_cached
+
     def _on_diff_configure(self, event: tk.Event) -> None:
         if event.width > 1:
             for sep in self._hunk_seps:
                 sep.configure(width=event.width)
+            row_w = max(event.width - self._diff_row_pad(), 1)
+            for f in self._comment_frames:
+                if f.winfo_exists():
+                    f.configure(width=row_w)
+            if self._active_comment_frame and self._active_comment_frame.winfo_exists():
+                self._active_comment_frame.configure(width=row_w)
 
     def _update_hunk_sep_widths(self) -> None:
         w = self._diff.winfo_width()
         if w > 1:
             for sep in self._hunk_seps:
                 sep.configure(width=w)
+            row_w = max(w - self._diff_row_pad(), 1)
+            for f in self._comment_frames:
+                if f.winfo_exists():
+                    f.configure(width=row_w)
+            if self._active_comment_frame and self._active_comment_frame.winfo_exists():
+                self._active_comment_frame.configure(width=row_w)
         else:
             self.root.after(50, self._update_hunk_sep_widths)
 
@@ -874,9 +995,12 @@ class App:
             if color is None:
                 line_cache[i] = blank
                 return blank
-            pixels = [color if x < len(text) and text[x] not in (' ', '\t') else bg
-                      for x in range(cw)]
-            result = '{' + ' '.join(pixels) + '}'
+            if kind == 'comment':
+                result = '{' + ' '.join([color] * cw) + '}'
+            else:
+                pixels = [color if x < len(text) and text[x] not in (' ', '\t') else bg
+                          for x in range(cw)]
+                result = '{' + ' '.join(pixels) + '}'
             line_cache[i] = result
             return result
 
@@ -924,6 +1048,8 @@ class App:
             self._scroll_target = float(first)
         self._update_sticky_header()
         self._update_minimap_viewport()
+        if self._hover_line >= 0 or self._hover_btn_line >= 0:
+            self._do_hide_hover()
 
     def _update_sticky_header(self) -> None:
         if not self._pos_order:
@@ -973,9 +1099,20 @@ class App:
         self._render_flist(entries)
 
     def _render_diff_panel(self) -> None:
+        self._cancel_hide_schedule()
+        self._comment_hover_btn.place_forget()
+        self._copy_hover_btn.place_forget()
+        self._hover_line = -1
+        self._hover_btn_line = -1
+        if self._active_comment_frame:
+            self._active_comment_frame.destroy()
+            self._active_comment_frame = None
+            self._active_comment_entry = None
+            self._comment_target = None
         for sep in self._hunk_seps:
             sep.destroy()
         self._hunk_seps.clear()
+        self._comment_frames.clear()
         self._diff.delete('1.0', 'end')
         self._positions.clear()
         self._minimap_lines = []
@@ -1004,13 +1141,7 @@ class App:
         self.root.after_idle(self._render_minimap)
         self.root.after_idle(self._update_hunk_sep_widths)
 
-    def _insert_word_diff(self, old_text: str, new_text: str) -> None:
-        """Insert a removed/added line pair with two-level background highlighting.
-
-        Equal words: white text on line background (subtle tint, like the rest of the line).
-        Changed words: white text on saturated background (clearly different).
-        Text colour is always white so nothing becomes illegible.
-        """
+    def _insert_word_diff(self, old_text: str, new_text: str, file_path: str) -> None:
         tok_old = re.findall(r'\w+|[^\w\s]|\s+', old_text) or ['']
         tok_new = re.findall(r'\w+|[^\w\s]|\s+', new_text) or ['']
         nws_old = [t for t in tok_old if not t.isspace()]
@@ -1018,12 +1149,15 @@ class App:
         if difflib.SequenceMatcher(None, nws_old, nws_new, autojunk=False).ratio() < CFG.word_diff_min_ratio:
             self._diff.insert('end', f'-{old_text}\n', 'removed')
             self._minimap_lines.append(('removed', '-' + old_text))
+            self._insert_comment_annotation(file_path, f'-{old_text}')
             self._diff.insert('end', f'+{new_text}\n', 'added')
             self._minimap_lines.append(('added', '+' + new_text))
+            self._insert_comment_annotation(file_path, f'+{new_text}')
             return
         if nws_old == nws_new and self._word_diff_var.get() == 2:
             self._diff.insert('end', f'~{new_text}\n', 'reindent')
             self._minimap_lines.append(('reindent', new_text))
+            self._insert_comment_annotation(file_path, f'~{new_text}')
             return
         opcodes = difflib.SequenceMatcher(None, tok_old, tok_new, autojunk=False).get_opcodes()
 
@@ -1034,6 +1168,7 @@ class App:
             self._diff.insert('end', text, tag)
         self._diff.insert('end', '\n')
         self._minimap_lines.append(('removed', '-' + old_text))
+        self._insert_comment_annotation(file_path, f'-{old_text}')
 
         self._diff.insert('end', '+', 'added')
         for op, i1, i2, j1, j2 in opcodes:
@@ -1042,6 +1177,7 @@ class App:
             self._diff.insert('end', text, tag)
         self._diff.insert('end', '\n')
         self._minimap_lines.append(('added', '+' + new_text))
+        self._insert_comment_annotation(file_path, f'+{new_text}')
 
     def _render_file_diff(self, df: DiffFile) -> None:
         word_diff = self._word_diff_var.get()
@@ -1052,20 +1188,24 @@ class App:
             if word_diff and pending_rem and pending_add:
                 for action in _pair_lines_for_word_diff(pending_rem, pending_add):
                     if action[0] == 'pair':
-                        self._insert_word_diff(action[1], action[2])
+                        self._insert_word_diff(action[1], action[2], df.path)
                     elif action[0] == 'rem':
                         self._diff.insert('end', f'-{action[1]}\n', 'removed')
                         self._minimap_lines.append(('removed', f'-{action[1]}'))
+                        self._insert_comment_annotation(df.path, f'-{action[1]}')
                     else:
                         self._diff.insert('end', f'+{action[1]}\n', 'added')
                         self._minimap_lines.append(('added', f'+{action[1]}'))
+                        self._insert_comment_annotation(df.path, f'+{action[1]}')
             else:
                 for old in pending_rem:
                     self._diff.insert('end', f'-{old}\n', 'removed')
                     self._minimap_lines.append(('removed', f'-{old}'))
+                    self._insert_comment_annotation(df.path, f'-{old}')
                 for new in pending_add:
                     self._diff.insert('end', f'+{new}\n', 'added')
                     self._minimap_lines.append(('added', f'+{new}'))
+                    self._insert_comment_annotation(df.path, f'+{new}')
             pending_rem.clear()
             pending_add.clear()
 
@@ -1091,6 +1231,7 @@ class App:
                 flush()
                 self._diff.insert('end', dl.text + '\n', dl.kind)
                 self._minimap_lines.append((dl.kind, dl.text))
+                self._insert_comment_annotation(df.path, dl.text)
         flush()
 
     def _render_flist(self, entries: list[FileEntry]) -> None:
@@ -1270,7 +1411,7 @@ class App:
         loc = f'{path}:{line_no}' if line_no is not None else path
         text = self._diff.get(f'{lines_start}.0', f'{lines_end}.end')
         self.root.clipboard_clear()
-        self.root.clipboard_append(f'{loc}\n{text}')
+        self.root.clipboard_append(f'{loc}\n{text}\n')
 
     def _show_diff_context_menu(self, event: tk.Event) -> None:
         text_line = int(self._diff.index(f'@{event.x},{event.y}').split('.')[0])
@@ -1313,6 +1454,250 @@ class App:
             command=lambda: self._copy_loc_and_lines(text_line))
 
         menu.tk_popup(event.x_root, event.y_root)
+
+    def _insert_comment_annotation(self, file_path: str, raw_line: str) -> None:
+        if self._review.is_empty():
+            return
+        comment = self._review.get(file_path, raw_line)
+        if not comment:
+            return
+        # end-2c steps past the implicit trailing \n that Tk Text always maintains,
+        # then past the \n we just inserted with the source line, landing on the source line.
+        src_line_no = int(self._diff.index('end-2c').split('.')[0])
+        frame = tk.Frame(self._diff, bg=self._comment_bg)
+        label = tk.Label(
+            frame, text=f'  >> {comment}',
+            bg=self._comment_bg, fg=C['bg'],
+            anchor='w', cursor='hand2',
+            font=(CFG.font_family, CFG.font_size),
+        )
+        btn = tk.Button(
+            frame, text='remove',
+            bg=self._comment_bg, fg=C['removed_fg'],
+            activebackground=self._comment_bg, activeforeground=C['removed_fg'],
+            relief='flat', bd=0, highlightthickness=0, cursor='hand2',
+            font=(CFG.font_family, int(CFG.menu_font_size * self._scale)),
+            command=lambda fp=file_path, rl=raw_line: self._delete_comment(fp, rl),
+        )
+        btn.pack(side='right', padx=4)
+        label.pack(side='left', fill='x', expand=True)
+        frame.update_idletasks()
+        h = max(label.winfo_reqheight(), btn.winfo_reqheight())
+        w = max(self._diff.winfo_width() - self._diff_row_pad(), 1)
+        frame.configure(width=w, height=h)
+        frame.pack_propagate(False)
+        def _on_click(e: tk.Event) -> str:
+            self._open_comment_editor(src_line_no)
+            return 'break'
+        label.bind('<Button-1>', _on_click)
+        frame.bind('<Button-1>', _on_click)
+        frame.bind('<Enter>', lambda e: self._do_hide_hover())
+        label.bind('<Enter>', lambda e: self._do_hide_hover())
+        btn.bind('<Enter>',   lambda e: self._do_hide_hover())
+        self._diff.window_create('end', window=frame)
+        self._diff.insert('end', '\n')
+        cmt_line_no = src_line_no + 1
+        self._diff.tag_add('comment', f'{cmt_line_no}.0', f'{cmt_line_no}.end')
+        self._comment_frames.append(frame)
+        self._minimap_lines.append(('comment', f'  >> {comment}'))
+
+    def _delete_comment(self, file_path: str, raw_line: str) -> None:
+        self._review.delete(file_path, raw_line)
+        self._rerender_preserving_scroll()
+
+    def _rerender_preserving_scroll(self) -> None:
+        top_line = int(self._diff.index('@0,0').split('.')[0])
+        self._render_diff_panel()
+        self._diff.yview(f'{top_line}.0')
+        self._scroll_target = self._diff.yview()[0]
+
+    def _cancel_hide_schedule(self) -> None:
+        if self._hide_after_id:
+            self.root.after_cancel(self._hide_after_id)
+            self._hide_after_id = None
+
+    def _schedule_hide(self) -> None:
+        self._cancel_hide_schedule()
+        self._hide_after_id = self.root.after(CFG.hover_hide_delay_ms, self._do_hide_hover)
+
+    def _on_btn_enter(self) -> None:
+        if self._btn_leave_after_id:
+            self.root.after_cancel(self._btn_leave_after_id)
+            self._btn_leave_after_id = None
+        self._over_hover_btn = True
+        self._cancel_hide_schedule()
+
+    def _on_btn_leave(self) -> None:
+        if self._btn_leave_after_id:
+            self.root.after_cancel(self._btn_leave_after_id)
+        self._btn_leave_after_id = self.root.after(CFG.hover_btn_leave_delay_ms, self._finalize_btn_leave)
+
+    def _finalize_btn_leave(self) -> None:
+        self._btn_leave_after_id = None
+        try:
+            target = self.root.winfo_containing(*self.root.winfo_pointerxy())
+        except tk.TclError:
+            target = None
+        if target in (self._comment_hover_btn, self._copy_hover_btn):
+            return
+        self._over_hover_btn = False
+        self._schedule_hide()
+
+    def _do_hide_hover(self) -> None:
+        self._hide_after_id = None
+        try:
+            target = self.root.winfo_containing(*self.root.winfo_pointerxy())
+        except tk.TclError:
+            target = None
+        if target in (self._comment_hover_btn, self._copy_hover_btn):
+            return
+        if self._hover_line >= 0:
+            self._diff.tag_remove('hover', f'{self._hover_line}.0', f'{self._hover_line}.end+1c')
+            self._hover_line = -1
+        self._comment_hover_btn.place_forget()
+        self._copy_hover_btn.place_forget()
+        self._hover_btn_line = -1
+
+    def _on_diff_hover(self, event: tk.Event) -> None:
+        if self._active_comment_frame or self._over_hover_btn:
+            return
+        self._cancel_hide_schedule()
+        line_no = int(self._diff.index(f'@{event.x},{event.y}').split('.')[0])
+        if line_no == self._hover_line:
+            return
+        tags = set(self._diff.tag_names(f'{line_no}.0'))
+        if not tags & {'added', 'removed', 'context'}:
+            self._do_hide_hover()
+            return
+        if self._hover_line >= 0:
+            self._diff.tag_remove('hover', f'{self._hover_line}.0', f'{self._hover_line}.end+1c')
+        self._hover_line = line_no
+        self._diff.tag_add('hover', f'{line_no}.0', f'{line_no}.end+1c')
+        bbox = self._diff.bbox(f'{line_no}.0')
+        if bbox:
+            _, y, _, h = bbox
+            comment_w = self._comment_hover_btn.winfo_reqwidth()
+            copy_w    = self._copy_hover_btn.winfo_reqwidth()
+            comment_x = self._diff.winfo_width() - comment_w - 4
+            copy_x    = comment_x - copy_w - 6
+            if copy_x > 0:
+                self._comment_hover_btn.place(x=comment_x, y=y, height=h)
+                self._copy_hover_btn.place(x=copy_x, y=y, height=h)
+                self._hover_btn_line = line_no
+            else:
+                self._comment_hover_btn.place_forget()
+                self._copy_hover_btn.place_forget()
+                self._hover_btn_line = -1
+        else:
+            self._comment_hover_btn.place_forget()
+            self._copy_hover_btn.place_forget()
+            self._hover_btn_line = -1
+
+    def _on_comment_btn_click(self) -> None:
+        line_no = self._hover_btn_line
+        self._do_hide_hover()
+        if line_no > 0:
+            self._open_comment_editor(line_no)
+
+    def _on_copy_btn_click(self) -> None:
+        line_no = self._hover_btn_line
+        self._do_hide_hover()
+        if line_no > 0:
+            self._copy_loc_and_lines(line_no)
+
+    def _on_comment_click(self, event: tk.Event) -> str | None:
+        if self._active_comment_frame:
+            return None
+        line_no = int(self._diff.index(f'@{event.x},{event.y}').split('.')[0])
+        self._do_hide_hover()
+        self._open_comment_editor(line_no)
+        return 'break'
+
+    def _open_comment_editor(self, line_no: int) -> None:
+        if self._active_comment_frame:
+            self._cancel_comment_edit()
+            return
+        if 'comment' in self._diff.tag_names(f'{line_no}.0'):
+            line_no -= 1
+            if line_no < 1:
+                return
+        raw_line = self._diff.get(f'{line_no}.0', f'{line_no}.end')
+        if not raw_line:
+            return
+        path, _ = self._source_location(line_no)
+        if not path:
+            return
+        existing = self._review.get(path, raw_line) or ''
+        self._comment_target = (path, raw_line)
+        bar_font = (CFG.font_family, int(CFG.menu_font_size * self._scale))
+        frame = tk.Frame(self._diff, bg=C['topbar_bg'])
+        prefix = tk.Label(frame, text='  >> ', bg=C['topbar_bg'], fg=C['comment_fg'],
+                          font=bar_font)
+        prefix.pack(side='left', padx=(4, 0), pady=2)
+        entry = tk.Entry(frame, bg=C['bg'], fg=C['comment_fg'],
+                         insertbackground=C['comment_fg'],
+                         relief='flat', bd=0, width=80,
+                         font=(CFG.font_family, CFG.font_size))
+        entry.pack(side='left', fill='x', expand=True, padx=(0, 4), pady=2)
+        frame.update_idletasks()
+        h = max(prefix.winfo_reqheight(), entry.winfo_reqheight()) + 4
+        w = max(self._diff.winfo_width() - self._diff_row_pad(), 1)
+        frame.configure(width=w, height=h)
+        frame.pack_propagate(False)
+        entry.insert(0, existing)
+        entry.selection_range(0, 'end')
+        entry.bind('<Return>', lambda e: self._confirm_comment_edit())
+        entry.bind('<Escape>', lambda e: self._cancel_comment_edit())
+        entry.bind('<FocusOut>', lambda e: self.root.after(CFG.edit_focus_out_delay_ms, self._cancel_if_still_active))
+        self._active_comment_frame = frame
+        self._active_comment_entry = entry
+        if 'comment' in self._diff.tag_names(f'{line_no + 1}.0'):
+            self._diff.delete(f'{line_no + 1}.0', f'{line_no + 1}.end')
+        else:
+            self._diff.insert(f'{line_no}.end', '\n')
+        self._diff.window_create(f'{line_no + 1}.0', window=frame)
+        entry.focus_set()
+
+    def _cancel_if_still_active(self) -> None:
+        if self._active_comment_frame:
+            if self._active_comment_entry and self._active_comment_entry.get().strip():
+                self._confirm_comment_edit()
+            else:
+                self._cancel_comment_edit()
+
+    def _cancel_comment_edit(self) -> None:
+        if self._active_comment_frame:
+            self._active_comment_frame.destroy()
+            self._active_comment_frame = None
+        self._active_comment_entry = None
+        self._comment_target = None
+        self._rerender_preserving_scroll()
+        self._diff.focus_set()
+
+    def _confirm_comment_edit(self) -> None:
+        if not self._active_comment_entry or not self._comment_target:
+            return
+        path, raw_line = self._comment_target
+        comment = self._active_comment_entry.get().strip()
+        if self._active_comment_frame:
+            self._active_comment_frame.destroy()
+            self._active_comment_frame = None
+        self._active_comment_entry = None
+        self._comment_target = None
+        if comment:
+            self._review.set(path, raw_line, comment)
+        else:
+            self._review.delete(path, raw_line)
+        self._rerender_preserving_scroll()
+        self._diff.focus_set()
+
+    def _dump_to_terminal(self) -> None:
+        if self._review.is_empty():
+            print('gitr: no review comments')
+            return
+        for file, line_text, comment in self._review.all_comments():
+            print(f'{file}  {line_text}')
+            print(f'  -> {comment}')
 
     def _jump_to(self, path: str) -> None:
         self._manual_scroll = False
