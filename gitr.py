@@ -77,6 +77,15 @@ class PatchSource:
     def label(self) -> str:
         return self._label
 
+    def commits(self) -> list[tuple[str, str]]:
+        return []
+
+    def has_staged(self) -> bool:
+        return False
+
+    def has_unstaged(self) -> bool:
+        return False
+
 class GitSource:
     """Diff text from a live git invocation. Can also fetch full file contents."""
     def __init__(self, refs: list[str], merge_base: bool = False) -> None:
@@ -102,6 +111,42 @@ class GitSource:
         if self._merge_base:
             return f'--merge-base {self._refs[0]}'
         return ' '.join(self._refs)
+
+    @staticmethod
+    def _has_changes(cmd: list[str]) -> bool:
+        try:
+            return subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0
+        except FileNotFoundError:
+            return False
+
+    def has_staged(self) -> bool:
+        return self._has_changes(['git', 'diff', '--cached', '--quiet'])
+
+    def has_unstaged(self) -> bool:
+        return self._has_changes(['git', 'diff', '--quiet'])
+
+    def commits(self) -> list[tuple[str, str]]:
+        try:
+            if self._merge_base:
+                sha = subprocess.check_output(
+                    ['git', 'merge-base', self._refs[0], 'HEAD'],
+                    text=True, stderr=subprocess.PIPE).strip()
+                range_arg = f'{sha}..HEAD'
+            elif len(self._refs) == 0:
+                return []
+            elif len(self._refs) == 1:
+                r = self._refs[0]
+                range_arg = r.replace('...', '..') if '..' in r else f'{r}..HEAD'
+            elif len(self._refs) == 2:
+                range_arg = f'{self._refs[0]}..{self._refs[1]}'
+            else:
+                return []
+            out = subprocess.check_output(
+                ['git', 'log', '--pretty=format:%h%x09%s', range_arg],
+                text=True, stderr=subprocess.PIPE)
+            return [tuple(line.split('\t', 1)) for line in out.splitlines() if '\t' in line]
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return []
 
 
 
@@ -325,6 +370,11 @@ class CFG:
     hover_hide_delay_ms     = 150
     hover_btn_leave_delay_ms = 80
     edit_focus_out_delay_ms = 50
+    list_pane_max_lines      = 10
+    menu_label_max_len       = 80
+    cmt_panel_label_max_len  = 120
+    section_collapsed_arrow  = '▶'
+    section_expanded_arrow   = '▼'
 
 
 # --colour scheme (dracula) --------------------------------------------------
@@ -384,6 +434,7 @@ _MINIMAP_COLORS: dict[str, str | None] = {
     'context':  _blend(C['fg'], 0.18),
     'reindent': _blend(C['fg'], 0.18),
     'comment':  _blend(C['comment_fg'], 0.80),
+    'orphan':   _blend(C['subdued'], 0.40),
 }
 
 
@@ -492,8 +543,19 @@ def _pair_lines_for_word_diff(
 
 
 class App:
-    def __init__(self, root: tk.Tk, diff_text: str) -> None:
+    def __init__(self, root: tk.Tk, diff_text: str,
+                 commits: 'list[tuple[str, str]] | None' = None,
+                 has_staged: bool = False, has_unstaged: bool = False) -> None:
         self.root = root
+        # Override Text/Entry class bindings so Ctrl+W/Q always close the window
+        # (default Text binding for Ctrl+W is "delete previous word", which would
+        # otherwise consume the event before our bind_all reaches it).
+        for cls in ('Text', 'Entry'):
+            root.bind_class(cls, '<Control-w>', lambda e: self._close_app())
+            root.bind_class(cls, '<Control-q>', lambda e: self._close_app())
+        root.bind_all('<Control-w>', lambda e: self._close_app())
+        root.bind_all('<Control-q>', lambda e: self._close_app())
+        root.protocol('WM_DELETE_WINDOW', self._close_app)
         self.diff_text = diff_text
         self._entries: list[FileEntry] = []
         self._diff_files: list[DiffFile] = []
@@ -506,6 +568,8 @@ class App:
         self._comment_frames: list[tk.Frame] = []
         self._render_occ: dict[str, dict[str, int]] = {}
         self._line_occurrence: dict[int, int] = {}
+        self._line_index: dict[str, dict[str, dict[int, int]]] = {}
+        self._comments_by_file: dict[str, list[tuple[str, int, str]]] = {}
         self._scroll_target: float = 0.0
         self._scroll_animating: bool = False
         self._flist_selected_row: int = -1
@@ -513,6 +577,9 @@ class App:
         self._flist_path_to_row: dict[str, int] = {}
         self._manual_scroll: bool = False
         self._review = ReviewStore()
+        self._commits = commits or []
+        self._has_staged = has_staged
+        self._has_unstaged = has_unstaged
         self._active_comment_frame: tk.Frame | None = None
         self._active_comment_entry: tk.Text | None = None
         self._comment_target: tuple[str, str, int] | None = None
@@ -539,8 +606,8 @@ class App:
         # read-only widget needs only a single call.
         widget.bind('<Key>', lambda e: 'break')
         widget.bind('<Control-c>', lambda e: None)
-        widget.bind('<Control-w>', lambda e: self.root.destroy())
-        widget.bind('<Control-q>', lambda e: self.root.destroy())
+        widget.bind('<Control-w>', lambda e: self._close_app())
+        widget.bind('<Control-q>', lambda e: self._close_app())
 
     def _make_scrollbar(self, parent: tk.Widget, **kw) -> tk.Scrollbar:
         return tk.Scrollbar(parent,
@@ -559,7 +626,7 @@ class App:
         menubar = tk.Menu(self.root, **menu_kw)
         file_menu = tk.Menu(menubar, tearoff=0, **menu_kw)
         file_menu.add_command(label='Quit', accelerator='Ctrl+Q',
-                              command=self.root.destroy)
+                              command=self._close_app)
         menubar.add_cascade(label='File', menu=file_menu)
         view_menu = tk.Menu(menubar, tearoff=0, **menu_kw)
         view_menu.add_checkbutton(label='Wrap long lines', variable=self._wrap_var,
@@ -704,10 +771,52 @@ class App:
         hs.grid_remove()
         corner.grid_remove()
 
-        # right: file list
+        # right: optional collapsible Comments + Commits panels above the file list
         rf = tk.Frame(self._sash, bg=C['bg'])
+
+        def _make_section_toggle(parent: tk.Frame, command) -> tk.Button:
+            return tk.Button(
+                parent, text='',
+                bg=C['topbar_bg'], fg=C['fg'],
+                activebackground=C['topbar_bg'], activeforeground=C['fg'],
+                relief='raised', bd=2, highlightthickness=0, cursor='hand2',
+                font=bar_font, padx=8, pady=4, anchor='w',
+                command=command)
+
+        def _make_list_text(parent: tk.Frame) -> tuple[tk.Frame, tk.Text]:
+            pane = tk.Frame(parent, bg=C['bg'])
+            txt = tk.Text(pane, bg=C['bg'], fg=C['fg'],
+                          font=font, wrap='none', height=1,
+                          relief='flat', bd=0, state='disabled', cursor='arrow',
+                          selectbackground=C['bg'], selectforeground=C['fg'],
+                          inactiveselectbackground=C['bg'])
+            sb = self._make_scrollbar(pane, orient='vertical', command=txt.yview)
+            txt.configure(yscrollcommand=sb.set)
+            sb.pack(side='right', fill='y')
+            txt.pack(fill='both', expand=True)
+            return pane, txt
+
+        # Comments section — created always; visibility/content updated per render.
+        self._comments_expanded = False
+        self._comments_header = tk.Frame(rf, bg=C['topbar_bg'])
+        self._comments_toggle = _make_section_toggle(self._comments_header, self._toggle_comments_pane)
+        self._comments_toggle.pack(fill='x')
+        self._comments_pane, self._cmt_list = _make_list_text(rf)
+
+        # Commits section — only when there are commits or staged/unstaged changes
+        self._commits_expanded = False
+        self._has_commits_section = bool(self._commits or self._has_staged or self._has_unstaged)
+        if self._has_commits_section:
+            self._commits_header = tk.Frame(rf, bg=C['topbar_bg'])
+            n = len(self._commits) + (1 if self._has_staged else 0) + (1 if self._has_unstaged else 0)
+            self._commits_toggle = _make_section_toggle(self._commits_header, self._toggle_commits_pane)
+            self._commits_toggle.configure(text=f'{CFG.section_collapsed_arrow} Commits ({n})')
+            self._commits_toggle.pack(fill='x')
+            self._commits_pane, self._clist = _make_list_text(rf)
+            self._clist.configure(height=min(n + 1, CFG.list_pane_max_lines))
+            self._render_clist()
+
         flist_bar = tk.Frame(rf, bg=C['topbar_bg'])
-        flist_bar.pack(fill='x')
         self._flist_btn = tk.Menubutton(flist_bar, bg=C['topbar_bg'], fg=C['fg'],
                                          activebackground=C['selected_bg'], activeforeground=C['fg'],
                                          relief='groove', bd=1, highlightthickness=0,
@@ -719,15 +828,25 @@ class App:
                                    command=lambda v=(name == 'tree'): self._set_tree_mode(v))
         self._flist_btn.pack(side='left')
         self._update_flist_bar()
-        self._flist = tk.Text(rf, bg=C['bg'], fg=C['fg'],
+
+        self._files_pane = tk.Frame(rf, bg=C['bg'])
+        self._flist = tk.Text(self._files_pane, bg=C['bg'], fg=C['fg'],
                                font=font, wrap='none',
                                relief='flat', bd=0, state='disabled', cursor='arrow',
                                selectbackground=C['bg'], selectforeground=C['fg'],
                                inactiveselectbackground=C['bg'])
-        fvs = self._make_scrollbar(rf, orient='vertical', command=self._flist.yview)
+        fvs = self._make_scrollbar(self._files_pane, orient='vertical', command=self._flist.yview)
         self._flist.configure(yscrollcommand=fvs.set)
         fvs.pack(side='right', fill='y')
         self._flist.pack(fill='both', expand=True)
+        self._flist_bar = flist_bar
+        # Pack the persistent rows in final top-to-bottom order. The
+        # comments/commits headers and panes get pack()ed in via _update_*
+        # / toggle methods using before=self._flist_bar (or _commits_header).
+        if self._has_commits_section:
+            self._commits_header.pack(fill='x')
+        flist_bar.pack(fill='x')
+        self._files_pane.pack(fill='both', expand=True)
 
         self._sash.add(lf, stretch='always')
         self._sash.add(rf, stretch='never')
@@ -763,6 +882,7 @@ class App:
         self._diff.tag_configure('removed_word', foreground=_blend(C['removed_fg'], CFG.diff_dim_fg), background=_blend(C['removed_fg'], CFG.diff_dim_blend))
         self._diff.tag_configure('added_word',   foreground=_blend(C['added_fg'],   CFG.diff_dim_fg), background=_blend(C['added_fg'],   CFG.diff_dim_blend))
         self._diff.tag_configure('reindent',     foreground=C['subdued'])
+        self._diff.tag_configure('orphan_src',   foreground=C['subdued'], background=C['topbar_bg'])
         _comment_bg = _blend(C['comment_fg'], 0.55)
         self._comment_bg = _comment_bg
         self._diff.tag_configure('comment', foreground=C['bg'], background=_comment_bg,
@@ -1128,8 +1248,12 @@ class App:
             sep.destroy()
         self._hunk_seps.clear()
         self._comment_frames.clear()
-        self._render_occ: dict[str, dict[str, int]] = {}
-        self._line_occurrence: dict[int, int] = {}
+        self._render_occ = {}
+        self._line_occurrence = {}
+        self._line_index = {}
+        self._comments_by_file = {}
+        for file, line, occ, cmt in self._review.all_comments():
+            self._comments_by_file.setdefault(file, []).append((line, occ, cmt))
         self._diff.delete('1.0', 'end')
         self._positions.clear()
         self._minimap_lines = []
@@ -1157,6 +1281,7 @@ class App:
         self.root.after_idle(self._update_sticky_header)
         self.root.after_idle(self._render_minimap)
         self.root.after_idle(self._update_hunk_sep_widths)
+        self.root.after_idle(self._update_comments_section)
 
     def _insert_word_diff(self, old_text: str, new_text: str, file_path: str) -> None:
         tok_old = re.findall(r'\w+|[^\w\s]|\s+', old_text) or ['']
@@ -1250,6 +1375,7 @@ class App:
                 self._minimap_lines.append((dl.kind, dl.text))
                 self._insert_comment_annotation(df.path, dl.text)
         flush()
+        self._insert_orphan_comments_for_file(df.path)
 
     def _render_flist(self, entries: list[FileEntry]) -> None:
         self._flist_selected_row = -1
@@ -1560,11 +1686,16 @@ class App:
         occurrence = per_file.get(raw_line, 0)
         per_file[raw_line] = occurrence + 1
         self._line_occurrence[src_line_no] = occurrence
+        self._line_index.setdefault(file_path, {}).setdefault(raw_line, {})[occurrence] = src_line_no
         if self._review.is_empty():
             return
         comment = self._review.get(file_path, raw_line, occurrence)
         if not comment:
             return
+        self._render_comment_frame(src_line_no, file_path, raw_line, occurrence, comment)
+
+    def _render_comment_frame(self, src_line_no: int, file_path: str, raw_line: str,
+                              occurrence: int, comment: str) -> None:
         cmt_display = self._format_comment_block(comment)
         frame = tk.Frame(self._diff, bg=self._comment_bg)
         label = tk.Label(
@@ -1603,6 +1734,18 @@ class App:
         self._comment_frames.append(frame)
         for line in cmt_display.splitlines() or ['']:
             self._minimap_lines.append(('comment', line))
+
+    def _insert_orphan_comments_for_file(self, file_path: str) -> None:
+        seen = self._render_occ.get(file_path, {})
+        for line_text, occurrence, comment in self._comments_by_file.get(file_path, []):
+            if seen.get(line_text, 0) > occurrence:
+                continue
+            self._diff.insert('end', line_text + '\n', 'orphan_src')
+            self._minimap_lines.append(('orphan', line_text))
+            src_line_no = int(self._diff.index('end-2c').split('.')[0])
+            self._line_occurrence[src_line_no] = occurrence
+            self._line_index.setdefault(file_path, {}).setdefault(line_text, {})[occurrence] = src_line_no
+            self._render_comment_frame(src_line_no, file_path, line_text, occurrence, comment)
 
     def _delete_comment(self, file_path: str, raw_line: str, occurrence: int) -> None:
         self._review.delete(file_path, raw_line, occurrence)
@@ -1816,19 +1959,35 @@ class App:
         self._rerender_preserving_scroll()
         self._diff.focus_set()
 
-    def _iter_visible_comments(self) -> 'Iterator[tuple[int, str, str, str]]':
-        ranges = self._diff.tag_ranges('comment')
-        for i in range(0, len(ranges), 2):
-            ln = int(str(ranges[i]).split('.')[0])
-            src_line = ln - 1
-            if src_line < 1:
-                continue
-            src_text = self._diff.get(f'{src_line}.0', f'{src_line}.end')
-            cmt = self._comment_for_line(ln)
-            loc = self._loc_for_line(src_line)
-            if not src_text or cmt is None or loc is None:
-                continue
-            yield src_line, loc, src_text, cmt
+    def _find_source_line(self, file_path: str, line_text: str, occurrence: int) -> 'int | None':
+        return self._line_index.get(file_path, {}).get(line_text, {}).get(occurrence)
+
+    @staticmethod
+    def _row_from_event(widget: tk.Text, event: tk.Event) -> int:
+        return int(widget.index(f'@{event.x},{event.y}').split('.')[0]) - 1
+
+    @staticmethod
+    def _bind_list_mouse_events(widget: tk.Text, on_click) -> None:
+        widget.bind('<Button-1>',         on_click)
+        widget.bind('<Double-Button-1>',  lambda e: 'break')
+        widget.bind('<Triple-Button-1>',  lambda e: 'break')
+        widget.bind('<B1-Motion>',        lambda e: 'break')
+
+    def _iter_all_comments(self) -> 'Iterator[tuple[int | None, str, str, str, bool]]':
+        """Yield (src_line, loc, src_text, comment, is_orphan) for every stored comment.
+        is_orphan is True when the stored line no longer matches an actual diff line
+        (the file may still be in the diff, in which case src_line points at a
+        rendered orphan placeholder)."""
+        for file, line_text, occurrence, comment in self._review.all_comments():
+            src_line = self._find_source_line(file, line_text, occurrence)
+            is_orphan = src_line is None or 'orphan_src' in self._diff.tag_names(f'{src_line}.0')
+            if src_line is None:
+                loc = file
+            elif is_orphan:
+                loc = f'{file} (orphaned)'
+            else:
+                loc = self._loc_for_line(src_line) or file
+            yield src_line, loc, line_text, comment, is_orphan
 
     def _rebuild_review_menu(self) -> None:
         m = self._review_menu
@@ -1836,14 +1995,15 @@ class App:
         m.add_command(label='Dump to terminal', command=self._dump_to_terminal)
         m.add_command(label='Clear all', command=self._clear_all_comments,
                       state='disabled' if self._review.is_empty() else 'normal')
-        items = list(self._iter_visible_comments())
+        items = list(self._iter_all_comments())
         if items:
             m.add_separator()
-            for src_line, loc, _src_text, cmt in items:
+            for src_line, loc, _src_text, cmt, _is_orphan in items:
                 first_line = (cmt.splitlines() or [cmt])[0]
-                label = f'{loc} - {first_line[:80]}'
+                label = f'{loc} - {first_line[:CFG.menu_label_max_len]}'
                 m.add_command(label=label,
-                              command=lambda ln=src_line: self._jump_to_diff_line(ln))
+                              state='disabled' if src_line is None else 'normal',
+                              command=lambda ln=src_line: self._jump_to_diff_line(ln) if ln else None)
 
     def _clear_all_comments(self) -> None:
         if self._review.is_empty():
@@ -1855,11 +2015,144 @@ class App:
         self._manual_scroll = False
         self._scroll_diff_to_line(line_no)
 
+    def _close_app(self) -> None:
+        if not self._review.is_empty():
+            self._dump_to_terminal()
+        self.root.destroy()
+
+    def _show_commit(self, sha: str) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(sha)
+        try:
+            out = subprocess.check_output(
+                ['git', 'show', '--stat', '--no-color', sha],
+                text=True, stderr=subprocess.PIPE)
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f'gitr: git show {sha} failed: {e}')
+            return
+        print(out)
+
+    @staticmethod
+    def _section_arrow(expanded: bool) -> str:
+        return CFG.section_expanded_arrow if expanded else CFG.section_collapsed_arrow
+
+    def _toggle_pane(self, expanded_attr: str, pane: tk.Frame, toggle_btn: tk.Button,
+                     title: str, count: int, anchor: tk.Widget) -> None:
+        expanded = getattr(self, expanded_attr)
+        if expanded:
+            pane.pack_forget()
+        else:
+            pane.pack(fill='x', before=anchor)
+        new_state = not expanded
+        setattr(self, expanded_attr, new_state)
+        toggle_btn.configure(text=f'{self._section_arrow(new_state)} {title} ({count})')
+
+    def _toggle_commits_pane(self) -> None:
+        if not self._has_commits_section:
+            return
+        n = len(self._commits) + (1 if self._has_staged else 0) + (1 if self._has_unstaged else 0)
+        self._toggle_pane('_commits_expanded', self._commits_pane, self._commits_toggle,
+                          'Commits', n, self._flist_bar)
+
+    def _comments_anchor(self) -> tk.Widget:
+        return self._commits_header if self._has_commits_section else self._flist_bar
+
+    def _toggle_comments_pane(self) -> None:
+        n = len(list(self._iter_all_comments()))
+        self._toggle_pane('_comments_expanded', self._comments_pane, self._comments_toggle,
+                          'Comments', n, self._comments_anchor())
+
+    def _update_comments_section(self) -> None:
+        items = list(self._iter_all_comments())
+        n = len(items)
+        anchor = self._comments_anchor()
+        if n == 0:
+            self._comments_pane.pack_forget()
+            self._comments_header.pack_forget()
+            self._comments_expanded = False
+            return
+        self._comments_header.pack_forget()
+        self._comments_header.pack(fill='x', before=anchor)
+        self._comments_toggle.configure(
+            text=f'{self._section_arrow(self._comments_expanded)} Comments ({n})')
+        self._render_cmt_list(items)
+        self._cmt_list.configure(height=min(n + 1, CFG.list_pane_max_lines))
+        if self._comments_expanded:
+            self._comments_pane.pack_forget()
+            self._comments_pane.pack(fill='x', before=anchor)
+
+    def _render_cmt_list(self, items: list) -> None:
+        self._cmt_list.tag_configure('loc',      foreground=C['fileheader_fg'])
+        self._cmt_list.tag_configure('cmt',      foreground=C['comment_fg'])
+        self._cmt_list.tag_configure('orphan',   foreground=C['subdued'])
+        self._cmt_list.configure(state='normal')
+        self._cmt_list.delete('1.0', 'end')
+        self._cmt_list_actions: list = []
+        for src_line, loc, _src_text, cmt, is_orphan in items:
+            first = (cmt.splitlines() or [cmt])[0]
+            self._cmt_list.insert('end', loc, 'orphan' if is_orphan else 'loc')
+            self._cmt_list.insert('end', '  ' + first[:CFG.cmt_panel_label_max_len] + '\n', 'cmt')
+            self._cmt_list_actions.append(src_line)
+        self._cmt_list.configure(state='disabled')
+        self._bind_list_mouse_events(self._cmt_list, self._on_cmt_list_click)
+
+    def _on_cmt_list_click(self, event: tk.Event) -> str:
+        row = self._row_from_event(self._cmt_list, event)
+        if 0 <= row < len(self._cmt_list_actions):
+            line = self._cmt_list_actions[row]
+            if line is not None:
+                self._jump_to_diff_line(line)
+        return 'break'
+
+    def _render_clist(self) -> None:
+        self._clist.tag_configure('sha',      foreground=C['fileheader_fg'])
+        self._clist.tag_configure('subject',  foreground=C['fg'])
+        self._clist.tag_configure('marker',   foreground=C['comment_fg'])
+        self._clist.tag_configure('selected', background=C['selected_bg'])
+        self._clist.configure(state='normal')
+        self._clist.delete('1.0', 'end')
+        self._clist_actions: list = []
+        if self._has_unstaged:
+            self._clist.insert('end', '* unstaged changes\n', 'marker')
+            self._clist_actions.append(('unstaged',))
+        if self._has_staged:
+            self._clist.insert('end', '* staged changes\n', 'marker')
+            self._clist_actions.append(('staged',))
+        if (self._has_unstaged or self._has_staged) and self._commits:
+            self._clist.insert('end', '\n')
+            self._clist_actions.append(None)
+        for sha, subject in self._commits:
+            self._clist.insert('end', sha, 'sha')
+            self._clist.insert('end', '  ' + subject + '\n', 'subject')
+            self._clist_actions.append(('commit', sha))
+        self._clist.configure(state='disabled')
+        self._bind_list_mouse_events(self._clist, self._on_clist_click)
+
+    def _on_clist_click(self, event: tk.Event) -> str:
+        row = self._row_from_event(self._clist, event)
+        if 0 <= row < len(self._clist_actions):
+            action = self._clist_actions[row]
+            if action and action[0] == 'commit':
+                self._show_commit(action[1])
+            elif action and action[0] == 'staged':
+                self._show_staged_or_unstaged(['git', 'diff', '--cached', '--no-color'])
+            elif action and action[0] == 'unstaged':
+                self._show_staged_or_unstaged(['git', 'diff', '--no-color'])
+        return 'break'
+
+    def _show_staged_or_unstaged(self, cmd: list[str]) -> None:
+        try:
+            out = subprocess.check_output(cmd, text=True, stderr=subprocess.PIPE)
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f'gitr: {" ".join(cmd)} failed: {e}')
+            return
+        print(out)
+
     def _dump_to_terminal(self) -> None:
         if self._review.is_empty():
             print('gitr: no review comments')
             return
-        for _src_line, loc, src_text, cmt in self._iter_visible_comments():
+        for _src_line, loc, src_text, cmt, _is_orphan in self._iter_all_comments():
             print(f'{loc}\n{src_text}\n{self._format_comment_block(cmt)}\n')
 
     def _jump_to(self, path: str) -> None:
@@ -1920,9 +2213,10 @@ def main() -> None:
     if src_label:
         title_parts.append(src_label)
     root.title(' | '.join(title_parts))
-    root.bind('<Control-w>', lambda _: root.destroy())
-    root.bind('<Control-q>', lambda _: root.destroy())
-    App(root, diff_text)
+    App(root, diff_text,
+        commits=source.commits(),
+        has_staged=source.has_staged(),
+        has_unstaged=source.has_unstaged())
     root.mainloop()
 
 
