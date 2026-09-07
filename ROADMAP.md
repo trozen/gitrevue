@@ -24,11 +24,20 @@ with the ability to attach persistent local comments to specific diff lines.
 - [x] Smooth scrolling, keyboard navigation (n/p/Tab for next/prev file)
 - [x] Config persistence: wrap, tree view, word diff
 - [x] Word-level diff: highlight changed words, dim unchanged words within changed lines
-- [ ] Inline annotations: double-click a line -> input box -> saved comment rendered inline
-- [ ] Comments stored in `.gitr/comments.json` (repo-local, gitignored)
+- [x] Inline annotations: hover button, `a` or the context menu opens an inline
+      editor; the saved comment renders as a bar below the line
+- [x] Comments stored in `.gitr/review.json` (repo-local) with file snapshots in
+      `.gitr/snapshots/`
+- [x] Comment kinds: note / good / bad, each with a colour and a text marker
+      (`>>`, `++`, `!!`) used on screen, in the panels and in the terminal dump;
+      one-click presets and a kind submenu in the context menu, a kind button on
+      the comment and in the editor (Ctrl+1/2/3)
+- [x] Comment markers on an overview strip beside the scrollbar
 - [ ] Commented files marked in file list
-- [ ] Robust comment anchoring: anchor to source file line + surrounding context,
-      not diff line number, so comments survive rebases and merges
+- [x] Robust comment anchoring: each comment is anchored to a snapshot of the
+      file taken when it was written; on load the snapshot is diffed against the
+      current file to remap the line, so comments survive edits, rebases and
+      merges (moved ones are flagged with `~`)
 
 ## Future
 
@@ -47,22 +56,27 @@ with the ability to attach persistent local comments to specific diff lines.
 
 ### Annotation storage format
 
-`<repo-root>/.gitr/comments.json`
+`<repo-root>/.gitr/review.json`, snapshots as plain text in `.gitr/snapshots/<sha1>`:
 
 ```json
 {
-  "version": 1,
-  "comments": [
-    {
-      "file": "src/foo.py",
-      "line": 42,
-      "text": "this logic seems wrong",
-      "ref": "abc1234",
-      "created_at": "2025-04-22T10:00:00"
-    }
-  ]
+  "files": {
+    "src/foo.py": [
+      {
+        "snapshot": "<sha1 of the file when the comment was written>",
+        "line_no": 42,
+        "side": "+",
+        "line_text": "+    return x",
+        "comment": "this logic seems wrong",
+        "kind": "bad"
+      }
+    ]
+  }
 }
 ```
+
+`side` is `+`, `-` or a space (the diff line kind); `kind` is `note`, `good`
+or `bad` and defaults to `note` when absent.
 
 ---
 

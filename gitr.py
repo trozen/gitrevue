@@ -95,6 +95,7 @@ class _ResolvedAnchor:
     side: str               # '+', '-', or ' '
     line_text: str          # diff line text including +/-/ prefix
     comment: str
+    kind: str = 'note'
     moved: bool = False
     matched: bool = False
     src_line: Optional[int] = None  # diff Text line number once rendered
@@ -292,7 +293,8 @@ class ReviewStore:
     JSON layout (.gitr/review.json):
       {"files": {"<path>": [
           {"snapshot": "<sha1>", "line_no": <int>, "side": "+|-| ",
-           "line_text": "<diff line text>", "comment": "<text>"}
+           "line_text": "<diff line text>", "comment": "<text>",
+           "kind": "note|good|bad"}      (absent = note)
       ]}}
 
     Snapshot blobs live in .gitr/snapshots/<sha1> as plain text. Multiple
@@ -372,17 +374,18 @@ class ReviewStore:
         return text
 
     def add(self, file: str, snapshot: str, line_no: int, side: str,
-            line_text: str, comment: str) -> None:
+            line_text: str, comment: str, kind: str = 'note') -> None:
         entries = self._data.setdefault(file, [])
         for e in entries:
             if (e.get('snapshot') == snapshot and e.get('line_no') == line_no
                     and e.get('side') == side):
                 e['line_text'] = line_text
                 e['comment'] = comment
+                e['kind'] = kind
                 self._save()
                 return
         entries.append({'snapshot': snapshot, 'line_no': line_no, 'side': side,
-                        'line_text': line_text, 'comment': comment})
+                        'line_text': line_text, 'comment': comment, 'kind': kind})
         self._save()
 
     def delete(self, file: str, snapshot: str, line_no: int, side: str) -> None:
@@ -623,7 +626,31 @@ C = {
     'status_D':      '#ff5555',
     'status_R':      '#ff79c6',
     'comment_fg':    '#f1fa8c',
+    'good_fg':       '#8be9fd',
+    'bad_fg':        '#ff79c6',
 }
+
+# Review comment kinds: colour and the marker shown before the text (on
+# screen and in the terminal dump, so the meaning survives without colour).
+# Cyan and pink are the bright tones the diff itself does not use.
+COMMENT_KINDS: dict[str, tuple[str, str]] = {
+    'note': (C['comment_fg'], '>>'),
+    'good': (C['good_fg'],    '++'),
+    'bad':  (C['bad_fg'],     '!!'),
+}
+# One-click comments offered in the diff's context menu.
+COMMENT_PRESETS: list[tuple[str, str]] = [
+    ('okay', 'good'), ('wtf', 'bad'), ('why?', 'note'), ('nice', 'good'), ('no', 'bad'),
+]
+
+
+def _comment_kind(name: object) -> str:
+    return name if isinstance(name, str) and name in COMMENT_KINDS else 'note'
+
+
+def _next_kind(kind: str) -> str:
+    kinds = list(COMMENT_KINDS)
+    return kinds[(kinds.index(kind) + 1) % len(kinds)]
 
 
 
@@ -662,6 +689,9 @@ def _mix(c1: str, c2: str, t: float) -> str:
 
 
 # non-whitespace pixel colours in the minimap; None = leave as canvas bg
+# Background of a comment's bar in the diff and of its minimap band.
+COMMENT_BGS: dict[str, str] = {k: _blend(col, 0.55) for k, (col, _m) in COMMENT_KINDS.items()}
+
 _MINIMAP_COLORS: dict[str, str | None] = {
     'added':    _blend(C['added_fg'],      0.45),
     'removed':  _blend(C['removed_fg'],    0.45),
@@ -670,7 +700,6 @@ _MINIMAP_COLORS: dict[str, str | None] = {
     'fileidx':  C['topbar_bg'],
     'context':  _blend(C['fg'], 0.18),
     'reindent': _blend(C['fg'], 0.18),
-    'comment':  C['bg'],  # ink; the row base is the comment bar colour
     'orphan':   _blend(C['subdued'], 0.40),
 }
 
@@ -759,10 +788,10 @@ _MM_DENSITY = _mm_density_table()
 # Drawn as full-width bars rather than text density: a one-line label is
 # invisible at 1 px per character, and these rows mark boundaries.
 _MM_SOLID_KINDS = frozenset(('filehdr', 'fileidx'))
-# Comment rows mirror the diff's comment bar: dark text on a yellow band.
-_MM_ROW_BASE = {'comment': _blend(C['comment_fg'], 0.55)}
-_MM_CHANNELS = {kind: _mm_channel_tables(col, _MM_ROW_BASE.get(kind, C['bg']))
+_MM_CHANNELS = {kind: _mm_channel_tables(col)
                 for kind, col in _MINIMAP_COLORS.items() if col is not None}
+# Comment rows mirror the diff's comment bar: dark text on the kind's band.
+_MM_COMMENT_CHANNELS = {k: _mm_channel_tables(C['bg'], bg) for k, bg in COMMENT_BGS.items()}
 
 
 def _use_autojunk(a: list[str], b: list[str]) -> bool:
@@ -904,7 +933,7 @@ class App:
         # the next render clears the cache.
         self._mm_rows: dict[int, bytes] = {}
         self._mm_rows_w: int = 0
-        self._mm_base_rows: dict[tuple[str, int], bytes] = {}
+        self._mm_base_rows: dict[tuple[str, int], bytes] = {}  # (kind, width) -> band row
         self._mm_painted: 'tuple[int, int] | None' = None  # (offset, band_h)
         # With wrapping on, a line spans ceil(len / cols) minimap rows so the
         # minimap matches what the screen shows; _mm_row_start[i] is the row
@@ -931,6 +960,7 @@ class App:
         # that line was inserted for it (a new comment) or belongs to an
         # existing comment being edited.
         self._editor_line: 'int | None' = None
+        self._editor_kind: str = 'note'
         self._editor_is_new: bool = False
         self._loaded: bool = False  # the deferred first _load has run
         self._rendering: bool = False  # inside a synchronous parse/render
@@ -1201,6 +1231,12 @@ class App:
         self._diff.bind('<Shift-Tab>',      lambda e: self._jump_to_adjacent_file(-1) or 'break')
         self._diff.bind('<ISO_Left_Tab>',   lambda e: self._jump_to_adjacent_file(-1) or 'break')
         self._diff.bind('<ButtonRelease-3>', self._show_diff_context_menu)
+        # One popup and one kind submenu, rebuilt per click: a menu created
+        # per click is never destroyed, and each radio entry adds a trace on
+        # the shared variable.
+        self._ctx_menu = tk.Menu(self.root, **self._menu_kw())
+        self._ctx_kind_menu = tk.Menu(self._ctx_menu, **self._menu_kw())
+        self._ctx_kind_var = tk.StringVar(value='note')
         self._diff.bind('<Motion>', self._on_diff_hover)
         self._diff.bind('<Leave>',  lambda e: self._schedule_hide())
         self.root.bind('<FocusOut>', self._on_root_focus_out, add='+')
@@ -1383,10 +1419,12 @@ class App:
         self._diff.tag_configure('added_word',   foreground=_blend(C['added_fg'],   CFG.diff_dim_fg), background=_blend(C['added_fg'],   CFG.diff_dim_blend))
         self._diff.tag_configure('reindent',     foreground=C['subdued'])
         self._diff.tag_configure('orphan_src',   foreground=C['subdued'], background=C['topbar_bg'])
-        _comment_bg = _blend(C['comment_fg'], 0.55)
-        self._comment_bg = _comment_bg
-        self._diff.tag_configure('comment', foreground=C['bg'], background=_comment_bg,
+        self._diff.tag_configure('comment', foreground=C['bg'], background=COMMENT_BGS['note'],
                                  spacing1=6, spacing3=6)
+        # The kind's colour behind the frame (the tag spacing shows around
+        # it); layered above 'comment', which every comment line keeps.
+        for k, bg in COMMENT_BGS.items():
+            self._diff.tag_configure(f'cmt_{k}', background=bg)
         self._comment_spacing1 = 6  # pixels between a comment line's top and its frame
         self._diff.tag_bind('comment', '<Button-1>', self._on_comment_click)
         self._diff.tag_bind('comment', '<Enter>', lambda e: self._diff.config(cursor='hand2'))
@@ -1395,6 +1433,8 @@ class App:
         self._diff.tag_configure('removed_hi',   foreground=C['removed_fg'], background=_rem_hi)
         self._diff.tag_configure('added_hi',     foreground=C['added_fg'],   background=_add_hi)
         self._diff.tag_lower('repaint')
+        for k in COMMENT_KINDS:
+            self._diff.tag_raise(f'cmt_{k}', 'comment')
         self._diff.tag_raise('hover_line')
         self._diff.tag_raise('hover')
         self._diff.tag_raise('sel')
@@ -1981,7 +2021,10 @@ class App:
         elif '\t' in text:
             text = text.expandtabs(8)
         cols = iw // chw
-        tables = _MM_CHANNELS.get(kind)
+        if kind == 'comment':
+            tables = _MM_COMMENT_CHANNELS[self._comment_kind_at(i)]
+        else:
+            tables = _MM_CHANNELS.get(kind)
         if tables is None:
             levels = bytes(cols)
             tables = _MM_CHANNELS['context']  # level 0 is the bg colour for every kind
@@ -2011,14 +2054,26 @@ class App:
         row = self._mm_line_row(r, iw, chw)
         if lh < 2 or self._minimap_lines[self._mm_line_of_row(r)[0]][0] != 'comment':
             return row * lh
-        return row * (lh - 1) + self._mm_base_row('comment', iw)
+        i = self._mm_line_of_row(r)[0]
+        return row * (lh - 1) + self._mm_comment_base_row(self._comment_kind_at(i), iw)
 
-    def _mm_base_row(self, kind: str, iw: int) -> bytes:
-        """One pixel row of `kind`'s no-ink colour."""
+    def _comment_kind_at(self, i: int) -> str:
+        """Kind of the comment occupying minimap line index `i` (0-based),
+        i.e. text line i + 1, whose source line is i. The editor wins while
+        it is open on that line: the stored anchor still holds the old kind."""
+        if self._editor_line == i + 1:
+            return self._editor_kind
+        anchor = self._line_to_anchor.get(i)
+        if anchor is not None and anchor.src_line == i:
+            return anchor.kind
+        return 'note'
+
+    def _mm_comment_base_row(self, kind: str, iw: int) -> bytes:
+        """One pixel row of the comment band colour for `kind`."""
         key = (kind, iw)
         row = self._mm_base_rows.get(key)
         if row is None:
-            tables = _MM_CHANNELS[kind]
+            tables = _MM_COMMENT_CHANNELS[kind]
             row = bytes((tables[0][0], tables[1][0], tables[2][0])) * iw
             self._mm_base_rows[key] = row
         return row
@@ -2662,9 +2717,9 @@ class App:
 
     # --overview strip -------------------------------------------------------
 
-    def _overview_marks(self) -> list[tuple[int, int]]:
-        """(comment line, source line) of every rendered comment, in order."""
-        return sorted((a.src_line + 1, a.src_line)
+    def _overview_marks(self) -> list[tuple[int, int, str]]:
+        """(comment line, source line, kind) of every rendered comment, in order."""
+        return sorted((a.src_line + 1, a.src_line, a.kind)
                       for a in self._line_to_anchor.values() if a.src_line is not None)
 
     def _overview_span(self) -> tuple[int, int]:
@@ -2731,9 +2786,9 @@ class App:
                     painted[y] = 1
                     c.create_rectangle(0, y, w, y + th, fill=C['topbar_bg'], outline='')
         mh = max(2, int(round(2 * self._scale)))
-        for line, src in self._overview_marks():
+        for line, src, kind in self._overview_marks():
             y = min(y_of(line), bottom - mh)
-            c.create_rectangle(0, y, w, y + mh, fill=C['comment_fg'], outline='')
+            c.create_rectangle(0, y, w, y + mh, fill=COMMENT_KINDS[kind][0], outline='')
             self._overview_drawn.append((y, src))
 
     def _on_overview_click(self, event: tk.Event) -> None:
@@ -2943,10 +2998,11 @@ class App:
 
     @staticmethod
     def _format_comment_block(comment: str, moved: bool = False,
-                              width: 'int | None' = None) -> str:
-        """The comment as shown in the diff: a marker on the first line and
-        indented continuation lines, wrapped to `width` columns if given."""
-        prefix       = '~ >> ' if moved else '  >> '
+                              width: 'int | None' = None, kind: str = 'note') -> str:
+        """The comment as shown in the diff: the kind's marker on the first
+        line and indented continuation lines, wrapped to `width` columns."""
+        marker = COMMENT_KINDS[kind][1]
+        prefix       = f'~ {marker} ' if moved else f'  {marker} '
         continuation = '~    ' if moved else '     '
         cmt_lines = comment.splitlines() or ['']
         if width is not None:
@@ -2962,14 +3018,14 @@ class App:
                          + [continuation + l for l in cmt_lines[1:]])
 
     def _comment_button_metrics(self) -> tuple[int, int]:
-        """(width, height) taken by a comment row's two buttons and their
+        """(width, height) taken by a comment row's buttons and their
         padding; measured once from throwaway buttons."""
         cached = getattr(self, '_comment_btn_metrics', None)
         if cached is not None:
             return cached
         font = (CFG.font_family, int(CFG.menu_font_size * self._scale))
         w = h = 0
-        for text in ('remove', 'copy(c)'):
+        for text in ('remove', 'copy(c)', max(COMMENT_KINDS, key=len)):
             b = tk.Button(self._diff, text=text, relief='flat', bd=0,
                           highlightthickness=0, font=font)
             w += b.winfo_reqwidth() + 8  # pack padx=4 on both sides
@@ -2987,7 +3043,8 @@ class App:
         return cols if cols >= CFG.comment_wrap_min_cols else None
 
     def _comment_block_for(self, anchor: '_ResolvedAnchor') -> str:
-        return self._format_comment_block(anchor.comment, anchor.moved, self._comment_wrap_cols())
+        return self._format_comment_block(anchor.comment, anchor.moved,
+                                          self._comment_wrap_cols(), anchor.kind)
 
     def _schedule_rewrap(self) -> None:
         # Coalesces the burst of <Configure> events from a resize drag.
@@ -3006,7 +3063,7 @@ class App:
             label, frame = anchor.label, anchor.frame
             if label is None or frame is None or not frame.winfo_exists():
                 continue
-            block = self._format_comment_block(anchor.comment, anchor.moved, cols)
+            block = self._format_comment_block(anchor.comment, anchor.moved, cols, anchor.kind)
             if label.cget('text') == block:
                 continue
             label.configure(text=block)
@@ -3067,7 +3124,7 @@ class App:
                 continue
             cmt = self._comment_for_line(ln)
             if cmt is not None:
-                parts.append(self._format_comment_block(cmt.comment, cmt.moved))
+                parts.append(self._format_comment_block(cmt.comment, cmt.moved, kind=cmt.kind))
         text = '\n'.join(parts)
         self.root.clipboard_clear()
         self.root.clipboard_append(f'{loc}\n{text}\n')
@@ -3085,11 +3142,29 @@ class App:
             return
 
         loc = f'{path}:{line_no}' if line_no is not None else path
-        menu_kw = dict(bg=C['topbar_bg'], fg=C['fg'],
-                       activebackground=C['selected_bg'], activeforeground=C['fg'],
-                       relief='flat', bd=0, tearoff=0,
-                       font=(CFG.font_family, int(CFG.menu_font_size * self._scale)))
-        menu = tk.Menu(self.root, **menu_kw)
+        menu = self._ctx_menu
+        menu.delete(0, 'end')
+        # Comment actions first: on a commented line (or its comment row)
+        # the comment's own menu; on a plain diff line, presets and editors.
+        # Neither while an editor is open: removing the comment under a live
+        # editor would destroy it from under the editor state.
+        src = text_line - 1 if 'comment' in self._diff.tag_names(f'{text_line}.0') else text_line
+        anchor = self._line_to_anchor.get(src)
+        if self._active_comment_frame:
+            pass
+        elif anchor is not None:
+            self._add_comment_menu_items(menu, anchor)
+            menu.add_separator()
+        elif src in self._line_post_image:
+            for text, kind in COMMENT_PRESETS:
+                col, marker = COMMENT_KINDS[kind]
+                menu.add_command(label=f'{marker} {text}', foreground=col,
+                                 command=lambda t=text, k=kind: self._add_comment_now(src, t, k))
+            menu.add_separator()
+            for kind, (col, marker) in COMMENT_KINDS.items():
+                menu.add_command(label=f'{marker} {kind.capitalize()} comment...', foreground=col,
+                                 command=lambda k=kind: self._open_comment_editor(src, k))
+            menu.add_separator()
         menu.add_command(label=f'Copy "{loc}"',
                          command=lambda: (self.root.clipboard_clear(),
                                           self.root.clipboard_append(loc)))
@@ -3120,6 +3195,74 @@ class App:
 
         menu.tk_popup(event.x_root, event.y_root)
 
+    def _menu_kw(self) -> dict:
+        return dict(bg=C['topbar_bg'], fg=C['fg'],
+                    activebackground=C['selected_bg'], activeforeground=C['fg'],
+                    relief='flat', bd=0, tearoff=0,
+                    font=(CFG.font_family, int(CFG.menu_font_size * self._scale)))
+
+    def _add_comment_menu_items(self, menu: tk.Menu, anchor: '_ResolvedAnchor') -> None:
+        menu.add_command(label='Edit comment',
+                         command=lambda a=anchor: a.src_line is not None and self._open_comment_editor(a.src_line))
+        self._ctx_kind_var.set(anchor.kind)
+        sub = self._ctx_kind_menu
+        sub.delete(0, 'end')
+        for kind, (col, marker) in COMMENT_KINDS.items():
+            sub.add_radiobutton(label=f'{marker} {kind}', foreground=col, selectcolor=col,
+                                variable=self._ctx_kind_var, value=kind,
+                                command=lambda a=anchor, k=kind: self._set_comment_kind(a, k))
+        menu.add_cascade(label=f'Change kind ({anchor.kind})', menu=sub)
+        menu.add_command(label='Remove comment', command=lambda a=anchor: self._delete_comment(a))
+
+    def _show_comment_context_menu(self, event: tk.Event, anchor: '_ResolvedAnchor') -> str:
+        if self._active_comment_frame:
+            return 'break'
+        menu = self._ctx_menu
+        menu.delete(0, 'end')
+        self._add_comment_menu_items(menu, anchor)
+        menu.tk_popup(event.x_root, event.y_root)
+        return 'break'
+
+    def _add_comment_now(self, line_no: int, text: str, kind: str) -> None:
+        """Add a preset comment below `line_no` without showing the editor."""
+        post = self._line_post_image.get(line_no)
+        if post is None or self._active_comment_frame or line_no in self._line_to_anchor:
+            return
+        file, new_line_no, side, line_text = post
+        target = _CommentEditTarget(file=file, new_line_no=new_line_no, side=side, line_text=line_text)
+        line = line_no + 1
+        self._insert_blank_line(line)
+        if not self._add_comment(line, target, text, kind):
+            self._delete_lines(line, 1)
+        self._update_sticky_header()  # the rest is covered by _embed_comment_frame
+        self._update_comments_section()
+
+    def _add_comment(self, line: int, target: '_CommentEditTarget', comment: str, kind: str) -> bool:
+        """Store a new comment for the source line above `line` (an empty
+        text line already opened for it) and embed its frame. False, with
+        nothing stored, when the file cannot be snapshotted."""
+        snap_sha = self._session_snapshots.get(target.file)
+        if not snap_sha:
+            content = self._read_current_file(target.file)
+            if content is not None:
+                snap_sha = self._review.write_snapshot(content)
+                self._session_snapshots[target.file] = snap_sha
+        if not snap_sha:
+            return False
+        src_line = line - 1
+        self._review.add(target.file, snap_sha, target.new_line_no,
+                         target.side, target.line_text, comment, kind)
+        anchor = _ResolvedAnchor(
+            file=target.file, snapshot=snap_sha, snap_line_no=target.new_line_no,
+            target_line_no=target.new_line_no, side=target.side,
+            line_text=target.line_text, comment=comment, kind=kind,
+            matched=True, src_line=src_line,
+        )
+        self._pending_anchors.setdefault(target.file, []).append(anchor)
+        self._line_to_anchor[src_line] = anchor
+        self._embed_comment_frame(line, anchor)
+        return True
+
     @staticmethod
     def _side_for_kind(kind: str) -> str:
         if kind == 'added':   return '+'
@@ -3144,6 +3287,7 @@ class App:
             side      = str(entry.get('side') or ' ')
             line_text = str(entry.get('line_text') or '')
             comment   = str(entry.get('comment') or '')
+            kind      = _comment_kind(entry.get('kind'))
             if not (snap_sha and line_no and comment):
                 continue
             if file not in current_cache:
@@ -3162,7 +3306,7 @@ class App:
             result.setdefault(file, []).append(_ResolvedAnchor(
                 file=file, snapshot=snap_sha, snap_line_no=line_no,
                 target_line_no=target, side=side, line_text=line_text,
-                comment=comment,
+                comment=comment, kind=kind,
             ))
         return result
 
@@ -3207,31 +3351,42 @@ class App:
 
     def _build_comment_frame(self, src_line_no: int, anchor: '_ResolvedAnchor') -> tk.Frame:
         cmt_display = self._comment_block_for(anchor)
-        frame = tk.Frame(self._diff, bg=self._comment_bg)
+        bg = COMMENT_BGS[anchor.kind]
+        frame = tk.Frame(self._diff, bg=bg)
         label = tk.Label(
             frame, text=cmt_display,
-            bg=self._comment_bg, fg=C['bg'],
+            bg=bg, fg=C['bg'],
             anchor='w', justify='left', cursor='hand2',
             font=(CFG.font_family, CFG.font_size),
         )
+        btn_font = (CFG.font_family, int(CFG.menu_font_size * self._scale))
         btn = tk.Button(
             frame, text='remove',
-            bg=self._comment_bg, fg=C['removed_fg'],
-            activebackground=self._comment_bg, activeforeground=C['removed_fg'],
+            bg=bg, fg=C['removed_fg'],
+            activebackground=bg, activeforeground=C['removed_fg'],
             relief='flat', bd=0, highlightthickness=0, cursor='hand2',
-            font=(CFG.font_family, int(CFG.menu_font_size * self._scale)),
+            font=btn_font,
             command=lambda a=anchor: self._delete_comment(a),
         )
         copy_btn = tk.Button(
             frame, text='copy(c)',
-            bg=self._comment_bg, fg=C['fg'],
-            activebackground=self._comment_bg, activeforeground=C['fg'],
+            bg=bg, fg=C['fg'],
+            activebackground=bg, activeforeground=C['fg'],
             relief='flat', bd=0, highlightthickness=0, cursor='hand2',
-            font=(CFG.font_family, int(CFG.menu_font_size * self._scale)),
+            font=btn_font,
             command=lambda a=anchor: self._copy_loc_and_lines((a.src_line or 0) + 1),
+        )
+        kind_btn = tk.Button(
+            frame, text=anchor.kind,
+            bg=bg, fg=C['bg'],  # the diff background reads as ink on the band
+            activebackground=bg, activeforeground=C['bg'],
+            relief='flat', bd=0, highlightthickness=0, cursor='hand2',
+            font=btn_font,
+            command=lambda a=anchor: self._cycle_comment_kind(a),
         )
         btn.pack(side='right', padx=4)
         copy_btn.pack(side='right', padx=4)
+        kind_btn.pack(side='right', padx=4)
         label.pack(side='left', fill='x', expand=True)
         # Requested sizes are valid without update_idletasks, and calling it
         # here would let Tk paint the half-built document mid-render.
@@ -3239,6 +3394,8 @@ class App:
         w = max(self._diff.winfo_width() - self._diff_row_pad(), 1)
         frame.configure(width=w, height=h)
         frame.pack_propagate(False)
+        frame.bind('<ButtonRelease-3>', lambda e, a=anchor: self._show_comment_context_menu(e, a))
+        label.bind('<ButtonRelease-3>', lambda e, a=anchor: self._show_comment_context_menu(e, a))
         def _on_click(e: tk.Event) -> str:
             if anchor.src_line is not None:
                 self._open_comment_editor(anchor.src_line)
@@ -3249,7 +3406,7 @@ class App:
         label.bind('<Enter>', lambda e: self._do_hide_hover())
         btn.bind('<Enter>',   lambda e: self._do_hide_hover())
         copy_btn.bind('<Enter>', lambda e: self._do_hide_hover())
-        for w in (frame, label, btn, copy_btn):
+        for w in (frame, label, btn, copy_btn, kind_btn):
             self._bind_wheel(w)
         self._discard_frame(anchor)
         anchor.frame = frame
@@ -3271,6 +3428,7 @@ class App:
         frame = self._build_comment_frame(line - 1, anchor)
         self._diff.window_create(f'{line}.0', window=frame)
         self._diff.tag_add('comment', f'{line}.0', f'{line}.end')
+        self._set_comment_line_kind_tag(line, anchor.kind)
         self._minimap_lines[line - 1] = ('comment', self._comment_block_for(anchor))
         self._mm_relayout()  # the block may have a different height now
         self._render_overview()  # a fresh comment gets its mark here, not via _after_line_edit
@@ -3285,7 +3443,30 @@ class App:
         self._flush_buf()
         cmt_line_no = src_line_no + 1
         self._diff.tag_add('comment', f'{cmt_line_no}.0', f'{cmt_line_no}.end')
+        self._set_comment_line_kind_tag(cmt_line_no, anchor.kind)
         self._minimap_lines.append(('comment', self._comment_block_for(anchor)))
+
+    def _set_comment_line_kind_tag(self, line: int, kind: str) -> None:
+        for k in COMMENT_KINDS:
+            self._diff.tag_remove(f'cmt_{k}', f'{line}.0', f'{line + 1}.0')
+        self._diff.tag_add(f'cmt_{kind}', f'{line}.0', f'{line}.end')
+
+    def _cycle_comment_kind(self, anchor: '_ResolvedAnchor') -> None:
+        self._set_comment_kind(anchor, _next_kind(anchor.kind))
+
+    def _set_comment_kind(self, anchor: '_ResolvedAnchor', kind: str) -> None:
+        """Change a comment's kind: store it and rebuild its frame the way an
+        edit does, which refreshes tag, minimap rows and overview mark."""
+        if kind == anchor.kind:
+            return
+        anchor.kind = kind
+        self._review.add(anchor.file, anchor.snapshot, anchor.snap_line_no,
+                         anchor.side, anchor.line_text, anchor.comment, kind)
+        if anchor.src_line is not None and anchor.frame is not None:
+            line = anchor.src_line + 1
+            self._diff.delete(f'{line}.0', f'{line}.end')  # Tk destroys the frame with its character
+            self._embed_comment_frame(line, anchor)
+        self._update_comments_section()
 
     def _remove_comment(self, anchor: '_ResolvedAnchor') -> None:
         """Take a rendered comment out of the widget without re-rendering.
@@ -3512,7 +3693,9 @@ class App:
         self._open_comment_editor(line_no)
         return 'break'
 
-    def _open_comment_editor(self, line_no: int) -> None:
+    def _open_comment_editor(self, line_no: int, kind: 'str | None' = None) -> None:
+        """Open the inline editor below `line_no`; `kind` preselects the
+        kind for a new comment (an existing comment keeps its own)."""
         if self._active_comment_frame:
             self._cancel_comment_edit()
             return
@@ -3529,6 +3712,7 @@ class App:
         file, new_line_no, side, line_text = post
         anchor = self._line_to_anchor.get(line_no)
         existing = anchor.comment if anchor else ''
+        self._editor_kind = anchor.kind if anchor else _comment_kind(kind)
         # The ruler must not stay up next to the editor; the button click's
         # own hide is not forced and yields while the pointer is on the button.
         self._do_hide_hover(force=True)
@@ -3542,8 +3726,23 @@ class App:
         prefix = tk.Label(frame, text='  >> ', bg=C['topbar_bg'], fg=C['comment_fg'],
                           font=bar_font)
         prefix.pack(side='left', padx=(4, 0), pady=2, anchor='nw')
+        kind_btn = tk.Button(frame, text='', bg=C['topbar_bg'], activebackground=C['selected_bg'],
+                             relief='flat', bd=0, highlightthickness=0, cursor='hand2', font=bar_font)
+        kind_btn.pack(side='right', padx=4, pady=2, anchor='ne')
         self._bind_wheel(frame)
         self._bind_wheel(prefix)
+        self._bind_wheel(kind_btn)
+        def _show_kind() -> None:
+            col, marker = COMMENT_KINDS[self._editor_kind]
+            prefix.configure(text=f'  {marker} ', fg=col)
+            kind_btn.configure(text=self._editor_kind, fg=col, activeforeground=col)
+            entry.configure(fg=col, insertbackground=col)
+        def _set_kind(k: str) -> str:
+            self._editor_kind = k
+            _show_kind()
+            self._resize_editor_frame(frame, prefix, entry)  # marker and minimap band
+            return 'break'
+        kind_btn.configure(command=lambda: _set_kind(_next_kind(self._editor_kind)))
         line_count = max(1, existing.count('\n') + 1)
         entry = tk.Text(frame, bg=C['bg'], fg=C['comment_fg'],
                         insertbackground=C['comment_fg'],
@@ -3568,6 +3767,9 @@ class App:
         entry.bind('<Alt-Return>',     _newline)
         entry.bind('<Alt-KP_Enter>',   _newline)
         entry.bind('<Escape>',         lambda e: self._cancel_comment_edit() or 'break')
+        for n, k in enumerate(COMMENT_KINDS, start=1):  # Ctrl+1/2/3: note/good/bad
+            entry.bind(f'<Control-Key-{n}>', lambda e, k=k: _set_kind(k))
+        _show_kind()
         entry.bind('<FocusOut>',       lambda e: self.root.after(CFG.edit_focus_out_delay_ms, self._cancel_if_still_active))
         def _on_modified(e: tk.Event) -> None:
             if entry.edit_modified():
@@ -3602,7 +3804,7 @@ class App:
             idx = self._editor_line - 1
             old = self._minimap_lines[idx]
             mm_entry = ('comment', self._format_comment_block(
-                entry.get('1.0', 'end-1c'), False, self._comment_wrap_cols()))
+                entry.get('1.0', 'end-1c'), False, self._comment_wrap_cols(), self._editor_kind))
             if old != mm_entry:
                 self._minimap_lines[idx] = mm_entry
                 if old[0] != 'comment' or old[1].count('\n') != mm_entry[1].count('\n'):
@@ -3628,8 +3830,8 @@ class App:
             else:
                 self._cancel_comment_edit()
 
-    def _close_editor(self) -> 'tuple[int, _CommentEditTarget | None, str]':
-        """Tear the editor widget down; returns (editor line, target, text)."""
+    def _close_editor(self) -> 'tuple[int, _CommentEditTarget | None, str, str]':
+        """Tear the editor widget down; returns (editor line, target, text, kind)."""
         text = self._active_comment_entry.get('1.0', 'end-1c') if self._active_comment_entry else ''
         if self._active_comment_frame:
             self._active_comment_frame.destroy()
@@ -3637,10 +3839,10 @@ class App:
         self._active_comment_entry = None
         target, self._comment_target = self._comment_target, None
         line, self._editor_line = self._editor_line, None
-        return line or 0, target, text.strip()
+        return line or 0, target, text.strip(), self._editor_kind
 
     def _cancel_comment_edit(self) -> None:
-        line, _target, _text = self._close_editor()
+        line, _target, _text, _kind = self._close_editor()
         if line:
             if self._editor_is_new:
                 self._delete_lines(line, 1)
@@ -3654,16 +3856,17 @@ class App:
     def _confirm_comment_edit(self) -> None:
         if not self._active_comment_entry or not self._comment_target:
             return
-        line, target, comment = self._close_editor()
+        line, target, comment, kind = self._close_editor()
         src_line = line - 1
         anchor = self._line_to_anchor.get(src_line)
         if target.existing_snapshot is not None and target.existing_snap_line_no is not None:
             if comment:
                 self._review.add(target.file, target.existing_snapshot,
                                  target.existing_snap_line_no,
-                                 target.side, target.line_text, comment)
+                                 target.side, target.line_text, comment, kind)
                 if anchor is not None:
                     anchor.comment = comment
+                    anchor.kind = kind
                     self._embed_comment_frame(line, anchor)
             else:
                 self._review.delete(target.file, target.existing_snapshot,
@@ -3671,25 +3874,7 @@ class App:
                 if anchor is not None:
                     self._remove_comment(anchor)
         elif comment:
-            snap_sha = self._session_snapshots.get(target.file)
-            if not snap_sha:
-                content = self._read_current_file(target.file)
-                if content is not None:
-                    snap_sha = self._review.write_snapshot(content)
-                    self._session_snapshots[target.file] = snap_sha
-            if snap_sha:
-                self._review.add(target.file, snap_sha, target.new_line_no,
-                                 target.side, target.line_text, comment)
-                anchor = _ResolvedAnchor(
-                    file=target.file, snapshot=snap_sha, snap_line_no=target.new_line_no,
-                    target_line_no=target.new_line_no, side=target.side,
-                    line_text=target.line_text, comment=comment,
-                    matched=True, src_line=src_line,
-                )
-                self._pending_anchors.setdefault(target.file, []).append(anchor)
-                self._line_to_anchor[src_line] = anchor
-                self._embed_comment_frame(line, anchor)
-            else:
+            if not self._add_comment(line, target, comment, kind):
                 self._delete_lines(line, 1)
                 self._after_line_edit()
         elif self._editor_is_new:
@@ -3709,10 +3894,10 @@ class App:
         widget.bind('<Triple-Button-1>',  lambda e: 'break')
         widget.bind('<B1-Motion>',        lambda e: 'break')
 
-    def _iter_all_comments(self) -> 'Iterator[tuple[int | None, str, str, str, bool, bool]]':
-        """Yield (src_line, loc, src_text, comment, is_orphan, moved) for every
-        stored comment. ``is_orphan`` covers both files-not-in-diff and lines
-        rendered via the orphan placeholder."""
+    def _iter_all_comments(self) -> 'Iterator[tuple[int | None, str, str, str, bool, bool, str]]':
+        """Yield (src_line, loc, src_text, comment, is_orphan, moved, kind) for
+        every stored comment. ``is_orphan`` covers both files-not-in-diff and
+        lines rendered via the orphan placeholder."""
         for file, anchors in self._pending_anchors.items():
             for a in anchors:
                 src_line = a.src_line
@@ -3724,7 +3909,7 @@ class App:
                     loc = f'{file} (orphaned)'
                 else:
                     loc = self._loc_for_line(src_line) or file
-                yield src_line, loc, a.line_text, a.comment, is_orphan, a.moved
+                yield src_line, loc, a.line_text, a.comment, is_orphan, a.moved, a.kind
 
     def _rebuild_review_menu(self) -> None:
         m = self._review_menu
@@ -3735,11 +3920,11 @@ class App:
         items = list(self._iter_all_comments())
         if items:
             m.add_separator()
-            for src_line, loc, _src_text, cmt, _is_orphan, moved in items:
+            for src_line, loc, _src_text, cmt, _is_orphan, moved, kind in items:
                 first_line = (cmt.splitlines() or [cmt])[0]
-                marker = '~ ' if moved else ''
-                label = f'{marker}{loc} - {first_line[:CFG.menu_label_max_len]}'
-                m.add_command(label=label,
+                marker = ('~ ' if moved else '') + COMMENT_KINDS[kind][1]
+                label = f'{marker} {loc} - {first_line[:CFG.menu_label_max_len]}'
+                m.add_command(label=label, foreground=COMMENT_KINDS[kind][0],
                               state='disabled' if src_line is None else 'normal',
                               command=lambda ln=src_line: self._jump_to_diff_line(ln) if ln else None)
 
@@ -3853,9 +4038,9 @@ class App:
 
     def _render_cmt_list(self, items: list) -> None:
         self._cmt_list.tag_configure('loc',      foreground=C['fileheader_fg'])
-        self._cmt_list.tag_configure('cmt',      foreground=C['comment_fg'])
         self._cmt_list.tag_configure('orphan',   foreground=C['subdued'])
-        self._cmt_list.tag_configure('moved',    foreground=C['comment_fg'])
+        for k, (col, _m) in COMMENT_KINDS.items():
+            self._cmt_list.tag_configure(f'cmt_{k}', foreground=col)
         self._cmt_list.configure(state='normal')
         self._cmt_list.delete('1.0', 'end')
         # One entry per logical line so _row_from_event maps clicks (including
@@ -3863,14 +4048,15 @@ class App:
         # line. Continuation lines of a multi-line comment repeat the same
         # source line so clicking any of them still jumps correctly.
         self._cmt_list_actions: list = []
-        for src_line, loc, _src_text, cmt, is_orphan, moved in items:
+        for src_line, loc, _src_text, cmt, is_orphan, moved, kind in items:
             lines = cmt.splitlines() or ['']
-            self._cmt_list.insert('end', '~ ' if moved and not is_orphan else '  ', 'moved')
+            tag = f'cmt_{kind}'
+            self._cmt_list.insert('end', '~ ' if moved and not is_orphan else '  ', tag)
             self._cmt_list.insert('end', loc, 'orphan' if is_orphan else 'loc')
-            self._cmt_list.insert('end', '  ' + lines[0] + '\n', 'cmt')
+            self._cmt_list.insert('end', f'  {COMMENT_KINDS[kind][1]} {lines[0]}\n', tag)
             self._cmt_list_actions.append(src_line)
             for cont in lines[1:]:
-                self._cmt_list.insert('end', '    ' + cont + '\n', 'cmt')
+                self._cmt_list.insert('end', '       ' + cont + '\n', tag)
                 self._cmt_list_actions.append(src_line)
         self._cmt_list.configure(state='disabled')
         self._bind_list_mouse_events(self._cmt_list, self._on_cmt_list_click)
@@ -3931,8 +4117,8 @@ class App:
         if self._review.is_empty():
             print('gitr: no review comments')
             return
-        for _src_line, loc, src_text, cmt, _is_orphan, moved in self._iter_all_comments():
-            print(f'{loc}\n{src_text}\n{self._format_comment_block(cmt, moved)}\n')
+        for _src_line, loc, src_text, cmt, _is_orphan, moved, kind in self._iter_all_comments():
+            print(f'{loc}\n{src_text}\n{self._format_comment_block(cmt, moved, kind=kind)}\n')
 
     def _jump_to(self, path: str) -> None:
         self._manual_scroll = False
