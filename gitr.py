@@ -582,6 +582,8 @@ class CFG:
     pane_min_w         = 180     # px; neither sash pane collapses below this
     scrollbar_w        = 16
     minimap_w          = 160
+    overview_w         = 6     # comment marker strip beside the scrollbar
+    overview_file_ticks = True # faint tick per file start on the strip
     scroll_speed       = 8   # lines per mouse-wheel tick
     diff_hi_blend      = 0.12   # bg intensity for changed lines / word-diff changed words
     diff_dim_blend     = 0.06   # bg intensity for word-diff unchanged words
@@ -1125,7 +1127,7 @@ class App:
 
         bar_font = (CFG.font_family, int(CFG.menu_font_size * self._scale))
         diff_bar = tk.Frame(lf, bg=C['topbar_bg'])
-        diff_bar.grid(row=0, column=0, columnspan=4, sticky='ew')
+        diff_bar.grid(row=0, column=0, columnspan=5, sticky='ew')
         menu_kw_bar = dict(bg=C['topbar_bg'], fg=C['fg'],
                            activebackground=C['selected_bg'], activeforeground=C['fg'],
                            relief='flat', bd=0, font=bar_font, tearoff=0)
@@ -1166,7 +1168,7 @@ class App:
 
         self._sticky = tk.Label(lf, bg=C['topbar_bg'], fg=C['fg'],
                                  font=font, anchor='w', padx=10, pady=3, text='')
-        self._sticky.grid(row=1, column=0, columnspan=4, sticky='ew')
+        self._sticky.grid(row=1, column=0, columnspan=5, sticky='ew')
 
         self._diff = tk.Text(lf, bg=C['bg'], fg=C['fg'],
                               font=font, wrap='char',
@@ -1242,10 +1244,24 @@ class App:
         self._minimap.bind('<B1-Motion>',  self._on_minimap_drag)
 
         self._diff_vs.grid(row=2, column=3, sticky='ns')
+        # Overview strip: the whole document mapped onto the strip's height,
+        # with a mark per comment (a Tk scrollbar cannot carry markers).
+        self._overview = tk.Canvas(lf, width=int(CFG.overview_w * self._scale),
+                                   bg=C['bg'], highlightthickness=0, cursor='hand2')
+        self._overview.grid(row=2, column=4, sticky='ns')
+        self._overview_refresh_id: 'str | None' = None
+        self._overview_total = -1  # document pixel height the strip was drawn for
+        self._overview_drawn: list[tuple[int, int]] = []  # (y, source line) as drawn
+        # Deferred: the strip's <Configure> arrives before the scrollbar has
+        # its new height, and a resize drag sends a storm of them.
+        self._overview.bind('<Configure>', lambda e: self._schedule_overview_refresh())
+        self._diff_vs.bind('<Configure>', lambda e: self._schedule_overview_refresh(), add='+')
+        self._overview.bind('<Button-1>', self._on_overview_click)
+        self._bind_wheel(self._overview)
         hs.grid(row=3, column=1, sticky='ew')
         _sw = int(CFG.scrollbar_w * self._scale)
         corner = tk.Frame(lf, bg=C['topbar_bg'], width=_sw, height=_sw)
-        corner.grid(row=3, column=3)
+        corner.grid(row=3, column=3, columnspan=2, sticky='ew')
         self._diff_hs = hs
         self._diff_hs_corner = corner
         # wrap on by default — horizontal scrollbar not needed
@@ -1434,6 +1450,7 @@ class App:
         self._save_config({'wrap_lines': wrap})
         self.root.after_idle(self._render_gutter)
         self.root.after_idle(self._mm_relayout)
+        self._schedule_overview_refresh()
 
     def _update_lineno_bar(self) -> None:
         name = ('off', 'new', 'old/new')[self._lineno_var.get()]
@@ -2204,6 +2221,7 @@ class App:
 
     def _on_diff_yscroll(self, first: str, last: str) -> None:
         self._diff_vs.set(first, last)
+        self._refresh_overview_if_stale()
         self._update_sticky_header()
         self._update_minimap_viewport()
         self._render_gutter()
@@ -2389,6 +2407,7 @@ class App:
         self.root.after_idle(self._update_hunk_sep_widths)
         self.root.after_idle(self._update_commits_section)
         self.root.after_idle(self._update_comments_section)
+        self.root.after_idle(self._render_overview)
         if self._wd_pending:
             # A timer rather than after_idle: the window must map and paint
             # before the highlighting pass starts competing for idle time.
@@ -2639,6 +2658,101 @@ class App:
         self._render_gutter()
         self._update_sticky_header()
         self._update_comments_section()  # its click targets are line numbers
+        self._render_overview()
+
+    # --overview strip -------------------------------------------------------
+
+    def _overview_marks(self) -> list[tuple[int, int]]:
+        """(comment line, source line) of every rendered comment, in order."""
+        return sorted((a.src_line + 1, a.src_line)
+                      for a in self._line_to_anchor.values() if a.src_line is not None)
+
+    def _overview_span(self) -> tuple[int, int]:
+        """(top, bottom) of the scrollbar's trough, in strip pixels.
+
+        The strip is as tall as the scrollbar, but the scrollbar's arrow
+        buttons take the ends, so marks are mapped onto the trough between
+        them to line up with the thumb. delta(0, 1) is the fraction one
+        pixel of the trough stands for, which gives its length exactly.
+        """
+        sb = self._diff_vs
+        h = sb.winfo_height()
+        try:
+            delta = sb.delta(0, 1)
+        except tk.TclError:
+            delta = 0.0
+        field = int(round(1 / delta)) + 1 if delta > 0 else 0
+        if field < 2 or field > h:
+            return 0, h  # collapsed or not yet laid out
+        top = (h - field) // 2
+        return top, top + field
+
+    def _schedule_overview_refresh(self) -> None:
+        if self._overview_refresh_id is None:
+            self._overview_refresh_id = self.root.after(50, self._render_overview)
+
+    def _refresh_overview_if_stale(self) -> None:
+        """Redraw the strip when the document's pixel height changed since
+        it was drawn: Tk measures line heights in the background for a while
+        after a render, moving the scrollbar thumb, and this is called from
+        the scroll callback Tk fires as it does so."""
+        if self._ypixels('1.0', 'end') != self._overview_total:
+            self._schedule_overview_refresh()
+
+    def _render_overview(self) -> None:
+        """Marks are pixel-proportional, from the same (possibly still
+        estimated) line metrics the scrollbar thumb is placed with, so a
+        mark sits where the thumb's top is when its line tops the view."""
+        if self._overview_refresh_id is not None:
+            self.root.after_cancel(self._overview_refresh_id)
+            self._overview_refresh_id = None
+        total = self._overview_total = self._ypixels('1.0', 'end')
+        c = self._overview
+        c.delete('all')
+        self._overview_drawn = []
+        w = c.winfo_width()
+        top, bottom = self._overview_span()
+        h = bottom - top
+        if h <= 1 or total <= 0:
+            return
+
+        def y_of(line: int) -> int:
+            return top + int(self._ypixels('1.0', f'{line}.0') * h / total)
+
+        if CFG.overview_file_ticks:
+            # Faint, 1 px, under the comment marks: a run of small files
+            # merges into a grey band, a large file shows as a gap. One
+            # item per strip row, however many files share it.
+            th = max(1, int(round(self._scale)))
+            painted = bytearray(bottom)
+            for line, _path in self._pos_order:
+                y = min(y_of(line), bottom - th)
+                if not painted[y]:
+                    painted[y] = 1
+                    c.create_rectangle(0, y, w, y + th, fill=C['topbar_bg'], outline='')
+        mh = max(2, int(round(2 * self._scale)))
+        for line, src in self._overview_marks():
+            y = min(y_of(line), bottom - mh)
+            c.create_rectangle(0, y, w, y + mh, fill=C['comment_fg'], outline='')
+            self._overview_drawn.append((y, src))
+
+    def _on_overview_click(self, event: tk.Event) -> None:
+        """A click on a mark jumps to its comment; elsewhere it scrolls to
+        the proportional position, like a scrollbar trough."""
+        top, bottom = self._overview_span()
+        h = bottom - top
+        if h <= 1:
+            return
+        # Hit-test what is drawn, not a recomputation: the drawing can lag
+        # Tk's metrics by a refresh, and the user clicked what they saw.
+        if self._overview_drawn:
+            y, src = min(self._overview_drawn, key=lambda m: abs(m[0] - event.y))
+            if abs(y - event.y) <= 4 * self._scale:
+                self._jump_to_diff_line(src)  # same path as the comments panel
+                return
+        self._manual_scroll = True
+        self._stop_scroll_animation()
+        self._move_view('moveto', str(min(1.0, max(0.0, (event.y - top) / h))))
 
     def _insert_blank_line(self, line: int) -> None:
         """Open an empty line at `line`, pushing the current one down."""
@@ -2902,6 +3016,7 @@ class App:
         if changed:
             self._mm_relayout()
             self._render_gutter()
+            self._schedule_overview_refresh()  # frames grew or shrank
 
     def _loc_for_line(self, line_no: int) -> str | None:
         path, ln = self._source_location(line_no)
@@ -3158,6 +3273,7 @@ class App:
         self._diff.tag_add('comment', f'{line}.0', f'{line}.end')
         self._minimap_lines[line - 1] = ('comment', self._comment_block_for(anchor))
         self._mm_relayout()  # the block may have a different height now
+        self._render_overview()  # a fresh comment gets its mark here, not via _after_line_edit
         self.root.after_idle(self._render_gutter)  # the row grew; no yscroll fires
 
     def _render_comment_frame(self, src_line_no: int, anchor: '_ResolvedAnchor') -> None:
@@ -3491,6 +3607,7 @@ class App:
                 self._minimap_lines[idx] = mm_entry
                 if old[0] != 'comment' or old[1].count('\n') != mm_entry[1].count('\n'):
                     self._schedule_mm_relayout()
+                    self._schedule_overview_refresh()
                 else:
                     r0 = self._mm_row_of(self._editor_line, 0)
                     for r in range(r0, r0 + mm_entry[1].count('\n') + 1):
